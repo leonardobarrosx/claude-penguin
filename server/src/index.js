@@ -5,57 +5,21 @@
  * autenticação guest por IP/cookie e persistência SQLite.
  */
 
-import http from 'node:http';
-import fs from 'node:fs';
 import { WebSocketServer, WebSocket } from 'ws';
 import crypto from 'crypto';
 import auth from './auth.js';
 import playerStore from './playerStore.js';
 import catalog from './catalog.js';
 import { clientIp, isLoopbackIp } from './net.js';
-import { getRoomConfig, MINIGAME_REWARDS, REWARD_MAX_PER_PACKET, REWARD_MAX_PER_MINUTE } from './rooms.js';
-import * as accounts from './accounts.js';
-import * as mod from './moderation.js';
-import * as worlds from './worlds.js';
-import * as game from './game.js';
+import { checkText, allowChat, hashTerm } from './chatFilter.js';
+import * as social from './socialStore.js';
 import * as tables from './tables.js';
 import * as parties from './parties.js';
-import log from './log.js';
-import { createAdminServer, setHooks as setAdminHooks } from './admin.js';
 
 const PORT = process.env.PORT || 8080;
-
-// HTTPS/WSS opcional: SSL_CERT_PATH + SSL_KEY_PATH (arquivos PEM).
-// Sem eles sobe HTTP/WS puro (dev local).
-function loadTls() {
-    const certPath = process.env.SSL_CERT_PATH;
-    const keyPath = process.env.SSL_KEY_PATH;
-    if (!certPath || !keyPath) return null;
-    try {
-        return { cert: fs.readFileSync(certPath), key: fs.readFileSync(keyPath) };
-    } catch (err) {
-        log.error('tls.load_failed', { certPath, keyPath, error: err.message });
-        return null;
-    }
-}
-const tls = loadTls();
-
-// Servidor HTTP único: /api/* e /admin (painel) + upgrade WebSocket.
 // maxPayload: pacotes do protocolo sao JSON pequenos (<2KB); 16KB e folga
 // generosa e impede flood de memoria via mensagens gigantes.
-const httpServer = createAdminServer(tls);
-const wss = new WebSocketServer({ server: httpServer, maxPayload: 16 * 1024 });
-httpServer.on('error', (err) => {
-    log.error('server.error', { error: err.message, code: err.code });
-    process.exit(1);
-});
-httpServer.listen(PORT, () => {
-    const proto = tls ? 'https/wss' : 'http/ws';
-    console.log(`🐧 Servidor Club Penguin rodando na porta ${PORT} (${proto})`);
-    console.log(`📡 WebSocket: ${tls ? 'wss' : 'ws'}://localhost:${PORT}`);
-    console.log(`🛠️  Painel admin: http://${tls ? 's' : ''}localhost:${PORT}/admin`);
-    log.info('server.started', { port: PORT, tls: !!tls, world: worlds.WORLD_ID });
-});
+const wss = new WebSocketServer({ port: PORT, maxPayload: 16 * 1024 });
 
 // Rate limit simples por socket (token bucket): ~30 pacotes/s em media,
 // burst de 60 — suficiente para jogo normal, bloqueia spam/flood.
@@ -77,26 +41,6 @@ const rooms = new Map();
 const clientSessions = new Map();
 // Mapeamento de socket para dados persistentes do jogador (playerData)
 const clientPlayerData = new Map();
-
-// Jogadores autenticados com socket aberto — base da lotação do mundo
-// e do heartbeat em worlds.online.
-function onlineCount() {
-    let n = 0;
-    for (const ws of clientPlayerData.keys()) {
-        if (ws.readyState === WebSocket.OPEN) n++;
-    }
-    return n;
-}
-
-function worldFull() {
-    return onlineCount() >= worlds.WORLD_CAPACITY;
-}
-
-// Ops que consomem vaga no mundo — bloqueadas quando o mundo está cheio
-const AUTH_OPS = new Set([
-    'AUTH_GUEST', 'LOGIN', 'REGISTER', 'CLAIM_ACCOUNT',
-    'LOGIN_PLAYER', 'SET_PASSWORD', 'RECOVER',
-]);
 
 const PAPERDOLL_SLOTS = ['feet', 'body', 'neck', 'hand', 'face', 'head'];
 // flag/photo = cosméticos do player card (pin/bandeira e fundo) — persistem
@@ -122,6 +66,12 @@ function sanitizePaperdoll(raw) {
     return outfit;
 }
 
+// pet "passeando" do jogador — info publica p/ renderizar o seguidor
+function publicPet(row) {
+    if (!row) return null;
+    return { petRowId: row.pet_row_id, species: row.species, name: row.name };
+}
+
 function publicPlayer(player) {
     return {
         playerId: player.playerId,
@@ -131,7 +81,8 @@ function publicPlayer(player) {
         color: player.color,
         colorItemId: player.colorItemId,
         paperdoll: player.paperdoll,
-        action: player.action || null
+        action: player.action || null,
+        pet: player.pet || null
     };
 }
 
@@ -140,7 +91,6 @@ function sendPlayerData(ws, playerData, sessionToken = null) {
     if (sessionToken) {
         data.sessionToken = sessionToken; // para localStorage fallback
     }
-    // Festa ativa (relógio do servidor) — pacote de sala, música etc.
     data.party = parties.partyClientData(parties.activeParty());
     ws.send(JSON.stringify({
         op: 'PLAYER_DATA',
@@ -154,6 +104,11 @@ function sendError(ws, code, message) {
         data: { code, message }
     }));
 }
+
+console.log(`===================================================`);
+console.log(`🐧 Servidor Club Penguin WebSocket rodando na porta ${PORT}`);
+console.log(`📡 URL de conexão: ws://localhost:${PORT}`);
+console.log(`===================================================`);
 
 function getRoom(roomId) {
     if (!rooms.has(roomId)) {
@@ -174,10 +129,120 @@ function broadcastToRoom(roomId, message, excludeSocket = null) {
     }
 }
 
+// ---------- Social / moderacao (fase 1) ----------
+
+// ids de jogadores com socket autenticado e em alguma sala
+function onlinePlayerIds() {
+    const set = new Set();
+    for (const p of clientSessions.values()) set.add(p.playerId);
+    return set;
+}
+
+// cache de ignore-sets por playerId (invalidado nas operacoes IGNORE_*)
+const ignoreCache = new Map();
+function ignoreSetOf(playerId) {
+    let s = ignoreCache.get(playerId);
+    if (!s) { s = social.getIgnoreSet(playerId); ignoreCache.set(playerId, s); }
+    return s;
+}
+function invalidateIgnore(playerId) { ignoreCache.delete(playerId); }
+
+// envia snapshot social completo: buddies+requests, ignores, pets
+function sendSocial(ws) {
+    const session = clientPlayerData.get(ws);
+    if (!session || !session.playerId) return;
+    const online = onlinePlayerIds();
+    const { buddies, requests } = social.getBuddyData(session.playerId, online);
+    ws.send(JSON.stringify({
+        op: 'SOCIAL_UPDATE',
+        data: {
+            buddies,
+            requests,
+            ignores: social.getIgnores(session.playerId),
+            pets: social.getPets(session.playerId),
+            petSpecies: social.listPetSpecies()
+        }
+    }));
+}
+
+// notifica um playerId online (se houver socket) com um op arbitrario
+function notifyPlayer(playerId, message) {
+    for (const p of clientSessions.values()) {
+        if (p.playerId === playerId && p.socket.readyState === WebSocket.OPEN) {
+            p.socket.send(JSON.stringify(message));
+            return true;
+        }
+    }
+    return false;
+}
+
+// chat filtrado por ignore: destinatarios que ignoram o remetente nao recebem
+function broadcastChat(roomId, message) {
+    const room = rooms.get(roomId);
+    if (!room) return;
+    const senderId = message.data.playerId;
+    const payloads = new Map(); // socket -> payload (sender sempre recebe)
+    for (const [pid, p] of room.entries()) {
+        if (p.socket.readyState !== WebSocket.OPEN) continue;
+        if (pid !== senderId && ignoreSetOf(pid).has(senderId)) continue;
+        payloads.set(p.socket, JSON.stringify(message));
+    }
+    for (const [sock, payload] of payloads) sock.send(payload);
+}
+
+function findSessionSocket(playerId) {
+    for (const p of clientSessions.values()) {
+        if (p.playerId === playerId && p.socket.readyState === WebSocket.OPEN) return p.socket;
+    }
+    return null;
+}
+
+// envia SOCIAL_UPDATE para o ws dono de um playerId (se online)
+function sendSocialToPlayer(playerId) {
+    const ws = findSessionSocket(playerId);
+    if (ws) sendSocial(ws);
+}
+
+function refreshCoins(ws, session) {
+    const pd = playerStore.getPublicPlayerData(session.playerId);
+    session.coins = pd.coins;
+    sendPlayerData(ws, pd, session.sessionToken);
+    return pd;
+}
+
+// cooldown de cuidado de pet: "playerId:petRowId" -> timestamp (5s)
+const petCareCooldown = new Map();
+
+// Jogos de mesa autoritativos (integracao PR): moedas pagas pelo servidor
+// atualizam o PLAYER_DATA do jogador (coins no HUD/card).
+tables.setTableHooks({
+    getSocket: (playerId) => findSessionSocket(playerId),
+    onCoins: (playerId) => {
+        const ws = findSessionSocket(playerId);
+        const session = ws && clientPlayerData.get(ws);
+        const playerData = playerStore.getPublicPlayerData(playerId);
+        if (session) session.coins = playerData.coins;
+        if (ws && ws.readyState === WebSocket.OPEN) sendPlayerData(ws, playerData, session?.sessionToken);
+    },
+});
+
+// Virada de festa: quando a festa ativa muda (relogio do servidor),
+// avisa todos os jogadores autenticados com PARTY_UPDATE.
+let lastPartyId = parties.activeParty()?.id ?? null;
+setInterval(() => {
+    const cur = parties.activeParty();
+    const curId = cur?.id ?? null;
+    if (curId === lastPartyId) return;
+    lastPartyId = curId;
+    const payload = JSON.stringify({ op: 'PARTY_UPDATE', data: { party: parties.partyClientData(cur) } });
+    for (const [sws] of clientPlayerData) {
+        if (sws.readyState === WebSocket.OPEN) sws.send(payload);
+    }
+}, 60 * 1000).unref?.();
+
 wss.on('connection', (ws, req) => {
     const ip = clientIp(req);
     console.log(`[+] Nova conexão estabelecida de ${ip}`);
-    log.info('ws.connect', { ip, world: worlds.WORLD_ID });
 
     ws.on('message', (raw) => {
         try {
@@ -202,16 +267,21 @@ wss.on('connection', (ws, req) => {
     });
 });
 
-// Arenovisk: pinguim de teste do dono do PC. Criado sob demanda via
-// LOGIN_PLAYER (somente loopback); a flag all_items faz hasItem/
-// getInventory cobrir o catalogo inteiro e coins generosas.
-const ARENOVISK_NAME = 'Arenovisk';
+// Pinguins de teste do dono do PC (IPs loopback). Criados sob demanda;
+// a flag all_items faz hasItem/getInventory cobrir o catalogo inteiro e
+// coins generosas para testar compras/equipamentos.
+// TEST_PENGUINS: ordem de ocupacao — se o primeiro ja estiver conectado
+// (ex.: segunda aba do browser no localhost), o proximo login recebe o
+// seguinte, permitindo testes multiplayer/buddy com 2 pinguins.
+const TEST_PENGUINS = ['Arenovisk', 'Penguin Test'];
+const ARENOVISK_NAME = TEST_PENGUINS[0];
 const ARENOVISK_COINS = 100000;
-function ensureArenovisk(ip) {
-    let player = playerStore.getPlayerByUsername(ARENOVISK_NAME);
+
+function ensureTestPlayer(name, ip) {
+    let player = playerStore.getPlayerByUsername(name);
     if (!player) {
-        player = playerStore.createPlayer(ip, ARENOVISK_NAME, 1);
-        console.log(`[ARENOVISK] Pinguim de teste '${ARENOVISK_NAME}' criado`);
+        player = playerStore.createPlayer(ip, name, 1);
+        console.log(`[TEST] Pinguim de teste '${name}' criado`);
     }
     if (!player.all_items) {
         playerStore.setAllItems(player.player_id, 1);
@@ -221,100 +291,39 @@ function ensureArenovisk(ip) {
     return player;
 }
 
-// Banimento ativo? Retorna o ban ou null. Usado no login e a cada entrada
-// em sala (cobre bans aplicados com o jogador online).
-function activeBanFor(playerId) {
-    return mod.activeBan(playerId);
+function ensureArenovisk(ip) {
+    return ensureTestPlayer(ARENOVISK_NAME, ip);
 }
 
-function banErrorData(ban) {
-    const until = ban.expires_at ? new Date(ban.expires_at).toISOString() : null;
-    return {
-        code: 'BANNED',
-        message: `Conta banida${ban.reason ? `: ${ban.reason}` : ''}${until ? ` (até ${until})` : ' (permanente)'}`
-    };
-}
-
-// Envia PLAYER_DATA com flags de conta + checa banimento
-function sendPlayerSessionChecked(ws, req, player, sessionToken) {
-    const ban = activeBanFor(player.player_id);
-    if (ban) {
-        sendError(ws, banErrorData(ban).code, banErrorData(ban).message);
-        return null;
+// true se o playerId ja tem um socket aberto autenticado (ocupado)
+function playerHasLiveSession(playerId, excludeWs = null) {
+    for (const [ws, s] of clientPlayerData) {
+        if (ws !== excludeWs && ws.readyState === WebSocket.OPEN && s.playerId === playerId) return true;
     }
-    return sendPlayerSession(ws, player, sessionToken);
+    return false;
 }
 
-// Acha o socket de um jogador online (para ações de moderação)
-function findSocketByPlayerId(playerId) {
-    for (const [ws, s] of clientPlayerData.entries()) {
-        if (s.playerId === playerId) return ws;
+// Escolhe o primeiro pinguim de teste livre; se todos ocupados, reusa o primeiro.
+function pickTestPenguin(ip) {
+    for (const name of TEST_PENGUINS) {
+        const p = ensureTestPlayer(name, ip);
+        if (!playerHasLiveSession(p.player_id)) return p;
     }
-    return null;
+    return ensureTestPlayer(TEST_PENGUINS[0], ip);
 }
 
-// Moderador ou admin? (player = linha hidratada com .role)
-function isModerator(player) {
-    return mod.hasRole(player, mod.ROLES.MODERATOR);
+// IPs que tem direito ao Arenovisk: por padrao so loopback (o PC do
+// tester). Para liberar outro IP (ex.: IP publico do tester em producao),
+// defina ARENOVISK_IPS="ip1,ip2" no ambiente do servidor.
+const ARENOVISK_IPS = new Set(
+    (process.env.ARENOVISK_IPS || '::1,127.0.0.1,::ffff:127.0.0.1')
+        .split(',').map((s) => s.trim()).filter(Boolean)
+);
+function isArenoviskIp(ip) {
+    return ARENOVISK_IPS.has(ip || '');
 }
 
-// API admin -> derruba jogador online (kick/ban pelo painel HTTP)
-// e expõe estatísticas ao vivo para /api/health e /api/metrics.
-setAdminHooks({
-    kickOnline(playerId, code, message) {
-        const targetWs = findSocketByPlayerId(playerId);
-        if (!targetWs) return;
-        try { sendError(targetWs, code, message); } catch { /* socket já morto */ }
-        handleDisconnect(targetWs, false);
-        targetWs.close();
-    },
-    liveStats() {
-        return {
-            online: onlineCount(),
-            connections: clientPlayerData.size,
-            rooms: rooms.size,
-            capacity: worlds.WORLD_CAPACITY,
-            world: worlds.WORLD_ID,
-        };
-    },
-});
-
-// Heartbeat: mantém worlds.online atualizado no banco compartilhado
-worlds.startHeartbeat(onlineCount);
-
-// Sistemas de jogo: lookup de socket para notificações entre jogadores
-game.setGameHooks({
-    getSocket: (playerId) => findSocketByPlayerId(playerId),
-});
-
-// Jogos de mesa autoritativos: moedas pagas pelo servidor -> atualiza o
-// PLAYER_DATA do jogador (coins no HUD/card) e as missoes EPF
-tables.setTableHooks({
-    getSocket: (playerId) => findSocketByPlayerId(playerId),
-    onCoins: (playerId, amount) => {
-        const ws = findSocketByPlayerId(playerId);
-        const session = ws && clientPlayerData.get(ws);
-        const playerData = playerStore.getPublicPlayerData(playerId);
-        if (session) session.coins = playerData.coins;
-        if (ws && ws.readyState === WebSocket.OPEN) sendPlayerData(ws, playerData, session?.sessionToken);
-        game.noteMission(playerId, 'earn_coins', amount);
-    },
-});
-
-// Virada de festa: quando a festa ativa muda (relógio do servidor),
-// avisa todos os jogadores autenticados com PARTY_UPDATE.
-let lastPartyId = parties.activeParty()?.id ?? null;
-setInterval(() => {
-    const cur = parties.activeParty();
-    const curId = cur?.id ?? null;
-    if (curId === lastPartyId) return;
-    lastPartyId = curId;
-    const payload = JSON.stringify({ op: 'PARTY_UPDATE', data: { party: parties.partyClientData(cur) } });
-    for (const ws of clientPlayerData.keys()) {
-        if (ws.readyState === WebSocket.OPEN) ws.send(payload);
-    }
-    log.info('party.changed', { party: cur?.name || null, id: curId });
-}, 60 * 1000).unref?.();
+// Login por nome (LOGIN_PLAYER) continua restrito a loopback por seguranca.
 
 // Automacao de teste (Playwright headless, scripts de QA) usa
 // "HeadlessChrome" no User-Agent — nao deve herdar o Arenovisk.
@@ -336,16 +345,13 @@ function generateGuestName() {
 
 // Aplica daily bonus, monta a sessao e envia PLAYER_DATA — fluxo comum
 // tanto para jogador existente quanto para guest recem-criado.
-// offerPasswordSetup: só contas legadas (sem senha, pré-fase-2) veem o
-// prompt "defina sua senha" — guests novos entram direto no jogo.
-function sendPlayerSession(ws, player, sessionToken, offerPasswordSetup = false) {
+function sendPlayerSession(ws, player, sessionToken) {
     const playerData = playerStore.getPublicPlayerData(player.player_id);
     const coinsBefore = playerData.coins;
     const withBonus = auth.applyDailyBonusIfNeeded(player.player_id);
     const finalData = playerStore.getPublicPlayerData(withBonus.player_id);
     const bonus = finalData.coins - coinsBefore;
     if (bonus > 0) finalData.dailyBonus = bonus;
-    if (offerPasswordSetup) finalData.passwordSetupOffered = true;
 
     clientPlayerData.set(ws, {
         playerId: player.player_id,
@@ -361,84 +367,46 @@ function sendPlayerSession(ws, player, sessionToken, offerPasswordSetup = false)
     return finalData;
 }
 
-// Emite sessão nova e envia PLAYER_DATA (+ ACCOUNT_INFO opcional com
-// código de recuperação — mostrado uma única vez ao jogador).
-function sendAccountSession(ws, req, player, accountInfo = null, offerPasswordSetup = false) {
-    const sessionToken = auth.issueSession(player, req);
-    const data = sendPlayerSession(ws, player, sessionToken, offerPasswordSetup);
-    if (accountInfo) {
-        ws.send(JSON.stringify({ op: 'ACCOUNT_INFO', data: accountInfo }));
-    }
-    return data;
-}
-
-function recoveryLabelFor(username) {
-    return `Claude Penguin - ${username}`;
-}
-
-// Gera novo recovery code, persiste o hash e devolve o código cru
-// (única vez que o cliente vê o valor).
-function rotateRecoveryCode(playerId, username) {
-    const code = accounts.generateRecoveryCode();
-    const label = recoveryLabelFor(username);
-    playerStore.setRecoveryCode(playerId, accounts.hashRecoveryCode(code), label);
-    return { recoveryCode: code, recoveryLabel: label };
-}
-
 function handlePacket(ws, req, packet) {
     const { op, data } = packet;
     if (!op || !data) return;
 
-    // Lista de mundos — público, funciona mesmo com o mundo cheio
-    if (op === 'SERVER_LIST') {
-        ws.send(JSON.stringify({ op: 'SERVER_LIST', data: { worlds: worlds.listWorlds(), current: worlds.WORLD_ID } }));
-        return;
-    }
-
-    // Ops de sistemas de jogo exigem jogador autenticado
-    const gameSession = clientPlayerData.get(ws);
-    if (gameSession?.playerId && tables.handleTableOp(ws, gameSession, packet)) {
-        return;
-    }
-    if (gameSession?.playerId && game.handleGameOp(ws, gameSession, packet)) {
-        return;
-    }
-
-    // Lotação do mundo: novas autenticações são recusadas quando cheio
-    if (AUTH_OPS.has(op) && worldFull()) {
-        sendError(ws, 'WORLD_FULL', 'Este mundo está lotado. Tente outro servidor.');
-        log.warn('world.full', { world: worlds.WORLD_ID, online: onlineCount() });
+    // Ops de jogos de mesa exigem jogador autenticado
+    const tableSession = clientPlayerData.get(ws);
+    if (tableSession?.playerId && tables.handleTableOp(ws, tableSession, packet)) {
         return;
     }
 
     switch (op) {
         case 'AUTH_GUEST': {
-            const ip = clientIp(req);
-
             // Cliente envia sessionToken do localStorage (se houver)
             const clientToken = data.sessionToken || null;
             const result = auth.identifyPlayer(req, clientToken);
+            const ip = clientIp(req);
+            const testIp = isArenoviskIp(ip) && !data.forceGuest && !isAutomationClient(req);
 
-            if (result.player) {
-                if (activeBanFor(result.player.player_id)) {
-                    const b = banErrorData(activeBanFor(result.player.player_id));
-                    sendError(ws, b.code, b.message);
-                } else {
-                    // Token legado (players.session_token) = conta pré-fase-2
-                    // sem senha: oferece o fluxo "defina sua senha".
-                    sendPlayerSession(ws, result.player, result.sessionToken,
-                        result.via === 'legacy' && !result.player.has_password);
-                    console.log(`[AUTH] Jogador '${result.player.username}' (${result.player.player_id}) autenticado`);
-                }
-            } else if (data.guest || data.forceGuest) {
+            // localhost: se o pinguim do token ja esta conectado em outro
+            // socket (ex.: segunda aba com o mesmo localStorage), nao reutiliza
+            // — cai no fluxo de pinguim de teste livre (Arenovisk -> Penguin Test)
+            const occupied = result.player && playerHasLiveSession(result.player.player_id, ws);
+
+            if (result.player && !(testIp && occupied)) {
+                sendPlayerSession(ws, result.player, result.sessionToken);
+                console.log(`[AUTH] Jogador '${result.player.username}' (${result.player.player_id}) autenticado via ${result.sessionToken ? 'token' : 'IP'}`);
+            } else if (testIp) {
+                // IP autorizado (PC do tester): recebe o proximo pinguim de
+                // teste livre. Demais IPs e automacao recebem guest novo.
+                const player = pickTestPenguin(ip);
+                const sessionToken = crypto.randomBytes(32).toString('hex');
+                playerStore.updatePlayerSession(player.player_id, sessionToken);
+                sendPlayerSession(ws, player, sessionToken);
+                console.log(`[AUTH] Pinguim de teste '${player.username}' (${player.player_id}) atribuido ao localhost`);
+            } else {
                 // Guest flow: cria o pinguim na hora, sem tela de conta
                 const guestName = generateGuestName();
-                const created = auth.createNewPlayer(result.ip, guestName, 1, req);
+                const created = auth.createNewPlayer(result.ip, guestName, 1);
                 sendPlayerSession(ws, created.player, created.sessionToken);
                 console.log(`[AUTH] Novo pinguim '${guestName}' (${created.player.player_id}) criado automaticamente`);
-            } else {
-                // Sem token e sem pedido de guest: cliente mostra tela de login
-                ws.send(JSON.stringify({ op: 'NEED_AUTH', data: {} }));
             }
             break;
         }
@@ -469,13 +437,9 @@ function handlePacket(ws, req, packet) {
             if (player.username.toLowerCase() === ARENOVISK_NAME.toLowerCase()) {
                 player = ensureArenovisk(ip);
             }
-            const sessionToken = auth.issueSession(player, req);
-            if (activeBanFor(player.player_id)) {
-                const b = banErrorData(activeBanFor(player.player_id));
-                sendError(ws, b.code, b.message);
-            } else {
-                sendPlayerSession(ws, player, sessionToken);
-            }
+            const sessionToken = crypto.randomBytes(32).toString('hex');
+            playerStore.updatePlayerSession(player.player_id, sessionToken);
+            sendPlayerSession(ws, player, sessionToken);
             console.log(`[LOGIN] '${player.username}' (${player.player_id}) login por nome (allItems=${!!player.all_items})`);
             break;
         }
@@ -488,8 +452,13 @@ function handlePacket(ws, req, packet) {
             }
 
             const { username, colorItemId = 1 } = data;
+            // moderacao: username passa pelo mesmo filtro de chat
+            if (checkText(username).blocked) {
+                sendError(ws, 'NAME_FILTERED', 'Esse nome não é permitido');
+                return;
+            }
             try {
-                const result = auth.createNewPlayer(session.ip, username, colorItemId, req);
+                const result = auth.createNewPlayer(session.ip, username, colorItemId);
                 const playerData = playerStore.getPublicPlayerData(result.player.player_id);
 
                 clientPlayerData.set(ws, {
@@ -510,205 +479,6 @@ function handlePacket(ws, req, packet) {
             break;
         }
 
-        case 'REGISTER': {
-            const ip = clientIp(req);
-            const username = accounts.normalizeUsername(data.username);
-            const password = String(data.password || '');
-            const key = accounts.usernameKey(username);
-
-            if (!accounts.authAttemptAllowed('ip', ip) ||
-                !accounts.authAttemptAllowed('account', key)) {
-                sendError(ws, 'RATE_LIMITED', 'Muitas tentativas. Tente mais tarde.');
-                return;
-            }
-            const fail = (code, msg) => sendError(ws, code, msg);
-            if (!accounts.isValidUsername(username)) {
-                fail('INVALID_USERNAME', 'Nome inválido (3-16 caracteres, sem caracteres especiais)');
-                return;
-            }
-            if (!accounts.isValidPassword(password)) {
-                fail('INVALID_PASSWORD', 'Senha deve ter entre 6 e 72 caracteres');
-                return;
-            }
-            if (playerStore.getPlayerByUsernameKey(key)) {
-                fail('USERNAME_TAKEN', 'Nome de usuário já está em uso');
-                return;
-            }
-
-            try {
-                const colorItemId = Number.isInteger(Number(data.colorItemId)) ? Number(data.colorItemId) : 1;
-                const player = playerStore.createPlayer(ip, username, colorItemId);
-                playerStore.setPasswordHash(player.player_id, accounts.hashPassword(password));
-                const info = rotateRecoveryCode(player.player_id, player.username);
-                accounts.authAttemptSucceeded('account', key);
-                accounts.authAttemptSucceeded('ip', ip);
-                sendAccountSession(ws, req, player, info);
-                console.log(`[REGISTER] Conta '${player.username}' (${player.player_id}) criada`);
-                log.info('auth.register', { playerId: player.player_id, username: player.username, ip });
-            } catch (err) {
-                sendError(ws, 'REGISTER_FAILED', err.message);
-            }
-            break;
-        }
-
-        case 'LOGIN': {
-            const ip = clientIp(req);
-            const username = accounts.normalizeUsername(data.username);
-            const password = String(data.password || '');
-            const key = accounts.usernameKey(username);
-
-            if (!accounts.authAttemptAllowed('ip', ip) ||
-                !accounts.authAttemptAllowed('account', key)) {
-                sendError(ws, 'RATE_LIMITED', 'Muitas tentativas. Tente mais tarde.');
-                return;
-            }
-            const fail = () => sendError(ws, 'INVALID_CREDENTIALS', 'Usuário ou senha incorretos');
-
-            const player = playerStore.getPlayerByUsernameKey(key);
-            if (!player) {
-                mod.recordLogin({ username, ip, userAgent: req?.headers?.['user-agent'], success: false });
-                fail(); return;
-            }
-            const stored = playerStore.getPasswordHash(player.player_id);
-            if (!stored) {
-                // Conta sem senha (guest/legada): oferece fluxo de claim
-                sendError(ws, 'NO_PASSWORD', 'Esta conta ainda não tem senha. Use "Definir senha".');
-                return;
-            }
-            if (!accounts.verifyPassword(password, stored)) {
-                mod.recordLogin({ playerId: player.player_id, username, ip, userAgent: req?.headers?.['user-agent'], success: false });
-                fail(); return;
-            }
-            if (activeBanFor(player.player_id)) {
-                const b = banErrorData(activeBanFor(player.player_id));
-                mod.recordLogin({ playerId: player.player_id, username, ip, userAgent: req?.headers?.['user-agent'], success: false });
-                sendError(ws, b.code, b.message);
-                return;
-            }
-
-            accounts.authAttemptSucceeded('account', key);
-            accounts.authAttemptSucceeded('ip', ip);
-            mod.recordLogin({ playerId: player.player_id, username, ip, userAgent: req?.headers?.['user-agent'], success: true });
-            sendAccountSession(ws, req, player);
-            console.log(`[LOGIN] '${player.username}' (${player.player_id}) login por senha`);
-            log.info('auth.login', { playerId: player.player_id, username: player.username, ip, world: worlds.WORLD_ID });
-            break;
-        }
-
-        case 'CLAIM_ACCOUNT': {
-            // Migração: conta sem senha pode definir senha enquanto o prazo
-            // de legado estiver ativo. Após o prazo, contas sem senha só
-            // entram como guest (AUTH_GUEST) — sem acesso à conta antiga.
-            const ip = clientIp(req);
-            const username = accounts.normalizeUsername(data.username);
-            const key = accounts.usernameKey(username);
-            if (!accounts.authAttemptAllowed('ip', ip) ||
-                !accounts.authAttemptAllowed('account', key)) {
-                sendError(ws, 'RATE_LIMITED', 'Muitas tentativas. Tente mais tarde.');
-                return;
-            }
-            const player = playerStore.getPlayerByUsernameKey(key);
-            if (!player) {
-                sendError(ws, 'INVALID_CREDENTIALS', 'Conta não encontrada');
-                return;
-            }
-            if (playerStore.hasPassword(player.player_id)) {
-                sendError(ws, 'ALREADY_HAS_PASSWORD', 'Esta conta já tem senha. Faça login.');
-                return;
-            }
-            if (!accounts.legacyGraceActive()) {
-                sendError(ws, 'MIGRATION_EXPIRED', 'Prazo para definir senha expirou');
-                return;
-            }
-            if (activeBanFor(player.player_id)) {
-                const b = banErrorData(activeBanFor(player.player_id));
-                sendError(ws, b.code, b.message);
-                return;
-            }
-            accounts.authAttemptSucceeded('account', key);
-            sendAccountSession(ws, req, player, null, true);
-            console.log(`[CLAIM] '${player.username}' (${player.player_id}) reivindicada para definir senha`);
-            break;
-        }
-
-        case 'SET_PASSWORD': {
-            const session = clientPlayerData.get(ws);
-            if (!session || !session.playerId) {
-                sendError(ws, 'NOT_AUTHENTICATED', 'Jogador não autenticado');
-                return;
-            }
-            const password = String(data.password || '');
-            if (!accounts.isValidPassword(password)) {
-                sendError(ws, 'INVALID_PASSWORD', 'Senha deve ter entre 6 e 72 caracteres');
-                return;
-            }
-            const player = playerStore.getPlayerById(session.playerId);
-            if (!player) { sendError(ws, 'NOT_FOUND', 'Jogador não encontrado'); return; }
-
-            playerStore.setPasswordHash(player.player_id, accounts.hashPassword(password));
-            const info = rotateRecoveryCode(player.player_id, player.username);
-            // Troca de senha revoga as OUTRAS sessões (a atual continua)
-            const currentHash = crypto.createHash('sha256').update(session.sessionToken || '').digest('hex');
-            accounts.revokeAllSessions(player.player_id, currentHash);
-
-            const playerData = playerStore.getPublicPlayerData(player.player_id);
-            session.coins = playerData.coins;
-            session.inventory = playerData.inventory;
-            sendPlayerData(ws, playerData, session.sessionToken);
-            ws.send(JSON.stringify({ op: 'ACCOUNT_INFO', data: info }));
-            console.log(`[SET_PASSWORD] '${player.username}' definiu senha`);
-            break;
-        }
-
-        case 'RECOVER': {
-            const ip = clientIp(req);
-            const username = accounts.normalizeUsername(data.username);
-            const code = accounts.normalizeRecoveryCode(data.code);
-            const newPassword = String(data.newPassword || '');
-            const key = accounts.usernameKey(username);
-
-            if (!accounts.authAttemptAllowed('ip', ip) ||
-                !accounts.authAttemptAllowed('account', `rec:${key}`)) {
-                sendError(ws, 'RATE_LIMITED', 'Muitas tentativas. Tente mais tarde.');
-                return;
-            }
-            const fail = () => sendError(ws, 'INVALID_RECOVERY', 'Usuário ou código inválido');
-
-            const player = playerStore.getPlayerByUsernameKey(key);
-            const stored = player ? playerStore.getRecoveryHash(player.player_id) : null;
-            if (!player || !stored || stored !== accounts.hashRecoveryCode(code)) {
-                fail();
-                return;
-            }
-            if (!accounts.isValidPassword(newPassword)) {
-                sendError(ws, 'INVALID_PASSWORD', 'Senha deve ter entre 6 e 72 caracteres');
-                return;
-            }
-
-            mod.recordLogin({ playerId: player.player_id, username, ip, userAgent: req?.headers?.['user-agent'], success: true });
-            playerStore.setPasswordHash(player.player_id, accounts.hashPassword(newPassword));
-            const info = rotateRecoveryCode(player.player_id, player.username);
-            accounts.revokeAllSessions(player.player_id); // derruba todos os logins
-            accounts.rateLimitClear(`account:rec:${key}`);
-            accounts.rateLimitClear(`account:${key}`);
-            accounts.rateLimitClear(`ip:${ip}`);
-            ws.send(JSON.stringify({ op: 'RECOVERY_OK', data: info }));
-            console.log(`[RECOVER] '${player.username}' recuperou a conta`);
-            break;
-        }
-
-        case 'LOGOUT': {
-            const session = clientPlayerData.get(ws);
-            if (session?.sessionToken) {
-                accounts.revokeSession(session.sessionToken);
-            }
-            clientPlayerData.delete(ws);
-            handleDisconnect(ws, false);
-            ws.send(JSON.stringify({ op: 'LOGGED_OUT', data: {} }));
-            console.log(`[-] Logout de ${session?.username || 'desconhecido'}`);
-            break;
-        }
-
         case 'LOAD_PLAYER': {
             const session = clientPlayerData.get(ws);
             if (!session || !session.playerId) {
@@ -720,45 +490,6 @@ function handlePacket(ws, req, packet) {
             if (playerData) {
                 sendPlayerData(ws, playerData, session.sessionToken);
             }
-            break;
-        }
-
-        case 'DEV_GIVE': {
-            // Debug local: somente loopback. {coins} absoluto ou {amount} delta.
-            // Atualiza o banco e reenvia PLAYER_DATA para todos os sockets
-            // do jogador — o jogo aberto em outra aba atualiza ao vivo.
-            const ip = clientIp(req);
-            if (!isLoopbackIp(ip)) {
-                sendError(ws, 'FORBIDDEN', 'Comando disponível apenas em localhost');
-                break;
-            }
-            const session = clientPlayerData.get(ws);
-            if (!session?.playerId) {
-                sendError(ws, 'NOT_AUTHENTICATED', 'Jogador não autenticado');
-                return;
-            }
-            const cur = playerStore.getPublicPlayerData(session.playerId);
-            if (!cur) { sendError(ws, 'NOT_FOUND', 'Jogador não encontrado'); break; }
-            let next;
-            if (Number.isFinite(Number(data.amount))) {
-                next = cur.coins + Math.trunc(Number(data.amount));
-            } else if (Number.isFinite(Number(data.coins))) {
-                next = Math.max(0, Math.trunc(Number(data.coins)));
-            } else {
-                sendError(ws, 'INVALID_DATA', 'Informe coins (absoluto) ou amount (delta)');
-                break;
-            }
-            playerStore.updatePlayerCoins(session.playerId, next);
-            const fresh = playerStore.getPublicPlayerData(session.playerId);
-            for (const [sws, s] of clientPlayerData) {
-                if (s.playerId !== session.playerId) continue;
-                s.coins = fresh.coins;
-                s.inventory = fresh.inventory;
-                s.equipped = fresh.equipped;
-                if (sws.readyState === WebSocket.OPEN) sendPlayerData(sws, fresh, s.sessionToken);
-            }
-            console.log(`[DEV_GIVE] ${session.username}: ${cur.coins} -> ${fresh.coins} coins`);
-            ws.send(JSON.stringify({ op: 'DEV_OK', data: { coins: fresh.coins } }));
             break;
         }
 
@@ -775,9 +506,8 @@ function handlePacket(ws, req, packet) {
                 return;
             }
 
-            // Preco autoritativo do catalogo — ignora `cost` do cliente.
-            // getAvailableItem respeita a vigência (validFrom/validTo).
-            const item = catalog.getAvailableItem(itemId);
+            // Preco autoritativo do catalogo — ignora `cost` do cliente
+            const item = catalog.getItem(itemId);
             if (!item) {
                 sendError(ws, 'UNKNOWN_ITEM', 'Item não existe no catálogo');
                 return;
@@ -802,7 +532,6 @@ function handlePacket(ws, req, packet) {
                     data: { itemId, name: item.name, cost, coins: playerData.coins }
                 }));
                 console.log(`[BUY] ${session.username} comprou item ${itemId} (${item.name}) por ${cost} coins`);
-                game.noteMission(session.playerId, 'buy_item');
             } catch (err) {
                 const code = /insuficientes/i.test(err.message) ? 'INSUFFICIENT_COINS' : 'BUY_FAILED';
                 sendError(ws, code, err.message);
@@ -817,30 +546,18 @@ function handlePacket(ws, req, packet) {
                 return;
             }
 
-            // Recompensa de minigame calculada no servidor: o cliente
-            // informa apenas o jogo e o nível concluído — `amount` do
-            // pacote é ignorado (antes permitia farm de coins).
-            const game = String(data.game || '');
-            const cfg = MINIGAME_REWARDS[game];
-            if (!cfg) {
-                sendError(ws, 'UNKNOWN_MINIGAME', 'Minigame desconhecido');
-                return;
-            }
+            // Recompensa de minigame — 50 coins por level concluido, ou
+            // `amount` explicito do cliente (ex.: Ice Fishing manda o score
+            // da rodada). Cap de 500 para evitar abuso.
             const level = Math.floor(Number(data.level));
-            if (!Number.isFinite(level) || level < 1 || level > cfg.maxLevel) {
+            if (!Number.isFinite(level) || level < 1 || level > 99) {
                 sendError(ws, 'INVALID_DATA', 'level inválido');
                 return;
             }
-            // Rate limit: máx. REWARD_MAX_PER_MINUTE recompensas por minuto
-            const now = Date.now();
-            const log = (session.rewardLog ||= []).filter((t) => now - t < 60_000);
-            session.rewardLog = log;
-            if (log.length >= REWARD_MAX_PER_MINUTE) {
-                sendError(ws, 'RATE_LIMITED', 'Muitas recompensas em pouco tempo');
-                return;
-            }
-            const reward = Math.min(level * cfg.perLevel, REWARD_MAX_PER_PACKET);
-            log.push(now);
+            const amount = Math.floor(Number(data.amount));
+            const reward = Number.isFinite(amount) && amount >= 1
+                ? Math.min(amount, 500)
+                : 50;
             playerStore.addCoins(session.playerId, reward);
             const playerData = playerStore.getPublicPlayerData(session.playerId);
             session.coins = playerData.coins;
@@ -850,7 +567,6 @@ function handlePacket(ws, req, packet) {
                 data: { level, reward, coins: playerData.coins }
             }));
             console.log(`[REWARD] ${session.username} concluiu level ${level} de minigame (+${reward} coins)`);
-            game.noteMission(session.playerId, 'earn_coins', reward);
             break;
         }
 
@@ -862,6 +578,10 @@ function handlePacket(ws, req, packet) {
             }
 
             const { username } = data;
+            if (checkText(username).blocked) {
+                sendError(ws, 'NAME_FILTERED', 'Esse nome não é permitido');
+                return;
+            }
             try {
                 const updated = playerStore.renamePlayer(session.playerId, username);
                 const playerData = playerStore.getPublicPlayerData(session.playerId);
@@ -886,33 +606,19 @@ function handlePacket(ws, req, packet) {
             }
 
             const { roomId = 'town' } = data;
-            const roomCfg = typeof roomId === 'string' ? getRoomConfig(roomId) : null;
-            if (!roomCfg) {
+            if (typeof roomId !== 'string' || !/^[a-z0-9_-]{1,24}$/i.test(roomId)) {
                 sendError(ws, 'INVALID_ROOM', 'Sala inválida');
                 return;
             }
-            // mesa de jogo de outra sala: levantar ao sair dela
+            // mesa de jogo: levantar ao entrar em outra sala
             tables.leaveRoomTables(session.playerId, roomId);
-            // Lotação máxima por sala
-            const room = getRoom(roomId);
-            if (room.size >= roomCfg.maxPlayers) {
-                sendError(ws, 'ROOM_FULL', 'Sala lotada, tente outra');
-                return;
-            }
-            // Banimento checado a cada entrada em sala
-            const ban = activeBanFor(session.playerId);
-            if (ban) {
-                const b = banErrorData(ban);
-                sendError(ws, b.code, b.message);
-                return;
-            }
-            const b = roomCfg.bounds;
-            const jx = Math.max(b.minX, Math.min(b.maxX, Number(data.x) || 400));
-            const jy = Math.max(b.minY, Math.min(b.maxY, Number(data.y) || 300));
+            const jx = Math.max(0, Math.min(760, Number(data.x) || 400));
+            const jy = Math.max(0, Math.min(480, Number(data.y) || 300));
 
             // Remove de sala anterior caso estivesse em alguma
             handleDisconnect(ws, false);
 
+            const room = getRoom(roomId);
             const player = {
                 playerId: session.playerId,
                 username: session.username,
@@ -923,6 +629,7 @@ function handlePacket(ws, req, packet) {
                 colorItemId: session.colorItemId || 1,
                 paperdoll: sanitizePaperdoll(session.equipped),
                 action: null,
+                pet: publicPet(social.getEquippedPet(session.playerId)),
                 socket: ws
             };
 
@@ -930,8 +637,6 @@ function handlePacket(ws, req, packet) {
             clientSessions.set(ws, player);
 
             console.log(`[JOIN] Jogador '${player.username}' (${player.playerId}) entrou na sala '${roomId}' em (${jx}, ${jy})`);
-            log.info('room.join', { playerId: player.playerId, username: player.username, room: roomId, world: worlds.WORLD_ID });
-            game.noteMission(player.playerId, 'join_room');
 
             // 1. Envia lista de todos os jogadores já presentes para o novo jogador
             const playerList = [];
@@ -960,11 +665,9 @@ function handlePacket(ws, req, packet) {
             if (!session) return;
 
             const { targetX, targetY } = data;
-            // Valida contra os limites da sala atual (rooms.js)
-            const cfg = getRoomConfig(session.roomId);
-            const b = cfg ? cfg.bounds : { minX: 0, minY: 0, maxX: 760, maxY: 480 };
-            const cx = Math.max(b.minX, Math.min(b.maxX, Number(targetX) || 0));
-            const cy = Math.max(b.minY, Math.min(b.maxY, Number(targetY) || 0));
+            // clamp nas coordenadas do mundo (760x480) — impede valores absurdos
+            const cx = Math.max(0, Math.min(760, Number(targetX) || 0));
+            const cy = Math.max(0, Math.min(480, Number(targetY) || 0));
             session.x = cx;
             session.y = cy;
             session.action = null; // andar cancela emote/acao (dance, sit...)
@@ -1001,45 +704,26 @@ function handlePacket(ws, req, packet) {
             const session = clientSessions.get(ws);
             if (!session) return;
 
-            const playerSession = clientPlayerData.get(ws);
             const { message } = data;
             if (!message || !message.trim()) return;
 
-            // Silenciamento (muted_until)
-            if (playerSession) {
-                const p = playerStore.getPlayerById(playerSession.playerId);
-                if (p && mod.isMuted(p)) {
-                    const mins = Math.ceil((p.muted_until - Date.now()) / 60000);
-                    sendError(ws, 'MUTED', `Você está silenciado por mais ${mins} min`);
-                    return;
-                }
-            }
+            const sanitized = message.trim().substring(0, 120);
 
-            // Limite de mensagens: máx. 4 por 5s por jogador
-            const now = Date.now();
-            const cq = (session.chatLog ||= []).filter((t) => now - t < 5000);
-            session.chatLog = cq;
-            if (cq.length >= 4) {
-                sendError(ws, 'CHAT_RATE_LIMITED', 'Calma! Muitas mensagens seguidas.');
+            // moderacao: rate limit (~5 msg/10s) + blacklist server-side
+            if (!allowChat(session.playerId)) {
+                sendError(ws, 'CHAT_RATE_LIMITED', 'Você está enviando mensagens rápido demais');
                 return;
             }
-            cq.push(now);
-
-            let sanitized = message.trim().substring(0, 120);
-
-            // Filtro de palavras (chat_filter_rule)
-            const filtered = mod.filterChatMessage(sanitized);
-            if (filtered?.blocked) {
-                sendError(ws, 'CHAT_BLOCKED', 'Mensagem bloqueada pelo filtro');
+            if (checkText(sanitized).blocked) {
+                console.warn(`[MOD] chat bloqueado player=${session.playerId} hash=${hashTerm(sanitized)}`);
+                sendError(ws, 'CHAT_FILTERED', 'Sua mensagem contém palavras não permitidas');
                 return;
             }
-            if (filtered?.masked) sanitized = filtered.masked;
 
             console.log(`[CHAT] [${session.roomId}] ${session.username}: "${sanitized}"`);
-            if (playerSession?.playerId) game.noteMission(playerSession.playerId, 'send_chat');
 
-            // Transmite a mensagem para todos na sala (incluindo o remetente)
-            broadcastToRoom(session.roomId, {
+            // Transmite a mensagem para todos na sala — exceto quem ignora o remetente
+            broadcastChat(session.roomId, {
                 op: 'SEND_CHAT',
                 data: {
                     playerId: session.playerId,
@@ -1047,118 +731,6 @@ function handlePacket(ws, req, packet) {
                     message: sanitized
                 }
             });
-            break;
-        }
-
-        case 'REPORT': {
-            const session = clientPlayerData.get(ws);
-            if (!session || !session.playerId) {
-                sendError(ws, 'NOT_AUTHENTICATED', 'Jogador não autenticado');
-                return;
-            }
-            const { targetPlayerId = null, targetMessage = null, reason = null } = data || {};
-            if (targetPlayerId && !playerStore.getPlayerById(targetPlayerId)) {
-                sendError(ws, 'INVALID_DATA', 'Jogador denunciado não encontrado');
-                return;
-            }
-            mod.createReport({
-                reporterId: session.playerId,
-                targetPlayerId,
-                targetMessage: typeof targetMessage === 'string' ? targetMessage.substring(0, 300) : null,
-                reason: typeof reason === 'string' ? reason.substring(0, 200) : null
-            });
-            mod.audit(session.playerId, 'report.create', targetPlayerId, { reason });
-            ws.send(JSON.stringify({ op: 'REPORT_OK', data: {} }));
-            console.log(`[REPORT] ${session.username} denunciou ${targetPlayerId || '(mensagem)'}`);
-            break;
-        }
-
-        // ---------- Ações de moderação (role >= moderator) ----------
-        case 'MOD_ACTION': {
-            const session = clientPlayerData.get(ws);
-            if (!session || !session.playerId) {
-                sendError(ws, 'NOT_AUTHENTICATED', 'Jogador não autenticado');
-                return;
-            }
-            const me = playerStore.getPlayerById(session.playerId);
-            if (!isModerator(me)) {
-                sendError(ws, 'FORBIDDEN', 'Apenas moderadores');
-                return;
-            }
-            const { action, targetPlayerId, reason = null, minutes = null } = data || {};
-            const target = targetPlayerId ? playerStore.getPlayerById(targetPlayerId) : null;
-            if (!target) { sendError(ws, 'INVALID_DATA', 'Jogador alvo não encontrado'); return; }
-            if (target.player_id === me.player_id) { sendError(ws, 'INVALID_DATA', 'Não pode agir em si mesmo'); return; }
-            // Só admin muda papéis (promover/rebaixar)
-            const adminOnly = new Set(['mod.set_role']);
-            if (adminOnly.has(action) && !mod.hasRole(me, mod.ROLES.ADMIN)) {
-                sendError(ws, 'FORBIDDEN', 'Apenas administradores');
-                return;
-            }
-
-            const targetWs = findSocketByPlayerId(target.player_id);
-            switch (action) {
-                case 'mod.kick': {
-                    if (targetWs) {
-                        sendError(targetWs, 'KICKED', `Expulso por ${me.username}${reason ? `: ${reason}` : ''}`);
-                        handleDisconnect(targetWs, false);
-                        targetWs.close();
-                    }
-                    mod.audit(me.player_id, 'mod.kick', target.player_id, { reason });
-                    break;
-                }
-                case 'mod.mute': {
-                    const mins = Math.max(1, Math.min(1440, Number(minutes) || 10));
-                    mod.setMutedUntil(target.player_id, Date.now() + mins * 60000);
-                    mod.addWarning(target.player_id, { moderatorId: me.player_id, reason: reason || `Silenciado por ${mins} min` });
-                    mod.audit(me.player_id, 'mod.mute', target.player_id, { minutes: mins, reason });
-                    break;
-                }
-                case 'mod.warn': {
-                    mod.addWarning(target.player_id, { moderatorId: me.player_id, reason });
-                    mod.audit(me.player_id, 'mod.warn', target.player_id, { reason });
-                    break;
-                }
-                case 'mod.ban': {
-                    const durationMs = minutes ? Math.min(Number(minutes), 60 * 24 * 365) * 60000 : null;
-                    mod.banPlayer(target.player_id, { reason, moderatorId: me.player_id, durationMs });
-                    if (targetWs) {
-                        const b = banErrorData(mod.activeBan(target.player_id));
-                        sendError(targetWs, b.code, b.message);
-                        handleDisconnect(targetWs, false);
-                        targetWs.close();
-                    }
-                    // revoga sessões do banido
-                    accounts.revokeAllSessions(target.player_id);
-                    mod.audit(me.player_id, 'mod.ban', target.player_id, { reason, minutes });
-                    break;
-                }
-                case 'mod.unban': {
-                    mod.unbanPlayerActive(target.player_id, me.player_id);
-                    mod.audit(me.player_id, 'mod.unban', target.player_id, {});
-                    break;
-                }
-                case 'mod.set_role': {
-                    const newRole = String(data.newRole || '');
-                    if (!Object.values(mod.ROLES).includes(newRole)) {
-                        sendError(ws, 'INVALID_DATA', 'Role inválida');
-                        return;
-                    }
-                    // Só admin rebaixa/promove; ninguém se promove
-                    playerStore.setRole(target.player_id, newRole);
-                    mod.audit(me.player_id, 'mod.set_role', target.player_id, { role: newRole });
-                    break;
-                }
-                default:
-                    sendError(ws, 'INVALID_DATA', 'Ação desconhecida');
-                    return;
-            }
-            ws.send(JSON.stringify({
-                op: 'MOD_OK',
-                data: { action, targetPlayerId: target.player_id, username: target.username }
-            }));
-            console.log(`[MOD] ${me.username} executou ${action} em ${target.username}`);
-            log.info('mod.action', { actor: me.username, actorId: me.player_id, action, target: target.username, targetId: target.player_id, reason });
             break;
         }
 
@@ -1217,7 +789,7 @@ function handlePacket(ws, req, packet) {
 
             // Valida posse quando o catalogo esta disponivel (cores pagas)
             if (catalog.isLoaded()) {
-                const item = catalog.getAvailableItem(colorItemId);
+                const item = catalog.getItem(colorItemId);
                 if (!item || item.type !== 1) {
                     sendError(ws, 'INVALID_COLOR', 'Cor inválida');
                     return;
@@ -1244,6 +816,251 @@ function handlePacket(ws, req, packet) {
                     color: colorItemId // compatibilidade
                 }
             }, ws);
+            break;
+        }
+
+        // ===================== SOCIAL (fase 1) =====================
+
+        case 'GET_SOCIAL': {
+            const session = clientPlayerData.get(ws);
+            if (!session || !session.playerId) {
+                sendError(ws, 'NOT_AUTHENTICATED', 'Jogador não autenticado');
+                return;
+            }
+            sendSocial(ws);
+            break;
+        }
+
+        case 'BUDDY_ADD': {
+            const session = clientPlayerData.get(ws);
+            if (!session || !session.playerId) return;
+            const username = String(data.username || '').trim();
+            if (!username) { sendError(ws, 'INVALID_DATA', 'username obrigatório'); return; }
+            if (checkText(username).blocked) {
+                sendError(ws, 'NAME_FILTERED', 'Esse nome não é permitido');
+                return;
+            }
+            const res = social.addBuddy(session.playerId, username, onlinePlayerIds());
+            if (res.error) {
+                sendError(ws, res.error === 'NO_SUCH_PLAYER' ? 'NO_SUCH_PLAYER' : res.error, res.error);
+                break;
+            }
+            sendSocial(ws);
+            if (res.pending) {
+                // confirma ao remetente (prompt "Request Sent") + notifica o alvo
+                ws.send(JSON.stringify({ op: 'BUDDY_REQUEST_SENT', data: { toUsername: username } }));
+                notifyPlayer(res.targetId, {
+                    op: 'BUDDY_REQUEST',
+                    data: { fromPlayerId: session.playerId, fromUsername: session.username }
+                });
+                sendSocialToPlayer(res.targetId);
+            } else if (res.autoAccepted) {
+                // aceite mutuo: notifica os dois lados
+                ws.send(JSON.stringify({
+                    op: 'BUDDY_ACCEPTED',
+                    data: { buddyPlayerId: res.targetId, buddyUsername: username }
+                }));
+                notifyPlayer(res.targetId, {
+                    op: 'BUDDY_ACCEPTED',
+                    data: { buddyPlayerId: session.playerId, buddyUsername: session.username }
+                });
+                sendSocialToPlayer(res.targetId);
+            }
+            console.log(`[BUDDY] ${session.username} -> '${username}' (${res.pending ? 'pending' : 'accepted'})`);
+            break;
+        }
+
+        case 'BUDDY_ACCEPT': {
+            const session = clientPlayerData.get(ws);
+            if (!session || !session.playerId) return;
+            const requesterId = String(data.playerId || '');
+            const res = social.acceptBuddy(session.playerId, requesterId);
+            if (res.error) { sendError(ws, res.error, res.error); break; }
+            sendSocial(ws);
+            const reqName = playerStore.getPlayerById(requesterId)?.username || requesterId;
+            notifyPlayer(requesterId, {
+                op: 'BUDDY_ACCEPTED',
+                data: { buddyPlayerId: session.playerId, buddyUsername: session.username }
+            });
+            // confirma tambem para quem aceitou
+            ws.send(JSON.stringify({
+                op: 'BUDDY_ACCEPTED',
+                data: { buddyPlayerId: requesterId, buddyUsername: reqName }
+            }));
+            // atualiza a lista do requester tambem
+            const reqWs = findSessionSocket(requesterId);
+            if (reqWs) {
+                const rs = clientPlayerData.get(reqWs);
+                if (rs) {
+                    const online = onlinePlayerIds();
+                    const bd = social.getBuddyData(rs.playerId, online);
+                    reqWs.send(JSON.stringify({ op: 'SOCIAL_UPDATE', data: {
+                        buddies: bd.buddies, requests: bd.requests,
+                        ignores: social.getIgnores(rs.playerId), pets: social.getPets(rs.playerId),
+                        petSpecies: social.listPetSpecies()
+                    }}));
+                }
+            }
+            console.log(`[BUDDY] ${session.username} aceitou pedido de '${reqName}'`);
+            break;
+        }
+
+        case 'BUDDY_DECLINE':
+        case 'BUDDY_CANCEL': {
+            const session = clientPlayerData.get(ws);
+            if (!session || !session.playerId) return;
+            const targetId = String(data.playerId || '');
+            const res = op === 'BUDDY_DECLINE'
+                ? social.declineBuddy(session.playerId, targetId)
+                : social.cancelBuddyRequest(session.playerId, targetId);
+            if (res.error) { sendError(ws, res.error, res.error); break; }
+            sendSocial(ws);
+            sendSocialToPlayer(targetId); // outro lado tambem atualiza
+            break;
+        }
+
+        case 'BUDDY_REMOVE': {
+            const session = clientPlayerData.get(ws);
+            if (!session || !session.playerId) return;
+            const buddyId = String(data.playerId || '');
+            social.removeBuddy(session.playerId, buddyId);
+            sendSocial(ws);
+            sendSocialToPlayer(buddyId);
+            break;
+        }
+
+        case 'IGNORE_ADD': {
+            const session = clientPlayerData.get(ws);
+            if (!session || !session.playerId) return;
+            const res = social.ignorePlayer(session.playerId, String(data.playerId || ''));
+            if (res.error) { sendError(ws, res.error, res.error); break; }
+            invalidateIgnore(session.playerId);
+            sendSocial(ws);
+            console.log(`[IGNORE] ${session.username} ignorou ${data.playerId}`);
+            break;
+        }
+
+        case 'IGNORE_REMOVE': {
+            const session = clientPlayerData.get(ws);
+            if (!session || !session.playerId) return;
+            social.unignorePlayer(session.playerId, String(data.playerId || ''));
+            invalidateIgnore(session.playerId);
+            sendSocial(ws);
+            break;
+        }
+
+        case 'PET_ADOPT': {
+            const session = clientPlayerData.get(ws);
+            if (!session || !session.playerId) {
+                sendError(ws, 'NOT_AUTHENTICATED', 'Jogador não autenticado');
+                return;
+            }
+            const species = String(data.species || '');
+            const sp = social.getPetSpecies(species);
+            if (!sp) { sendError(ws, 'UNKNOWN_SPECIES', 'Espécie desconhecida'); return; }
+            const player = playerStore.getPlayerById(session.playerId);
+            if (!player || player.coins < sp.cost) {
+                sendError(ws, 'INSUFFICIENT_COINS', 'Moedas insuficientes');
+                return;
+            }
+            if (checkText(data.name).blocked) {
+                sendError(ws, 'NAME_FILTERED', 'Esse nome não é permitido');
+                return;
+            }
+            playerStore.addCoins(session.playerId, -sp.cost);
+            const res = social.adoptPet(session.playerId, species, data.name);
+            if (res.error) { sendError(ws, res.error, res.error); return; }
+            refreshCoins(ws, session);
+            sendSocial(ws);
+            console.log(`[PET] ${session.username} adotou ${sp.name} por ${sp.cost} coins`);
+            break;
+        }
+
+        case 'PET_RENAME': {
+            const session = clientPlayerData.get(ws);
+            if (!session || !session.playerId) return;
+            if (checkText(data.name).blocked) {
+                sendError(ws, 'NAME_FILTERED', 'Esse nome não é permitido');
+                return;
+            }
+            const res = social.renamePet(session.playerId, Number(data.petRowId), data.name);
+            if (res.error) { sendError(ws, res.error, res.error); break; }
+            sendSocial(ws);
+            break;
+        }
+
+        case 'PET_RELEASE': {
+            const session = clientPlayerData.get(ws);
+            if (!session || !session.playerId) return;
+            const res = social.releasePet(session.playerId, Number(data.petRowId));
+            if (res.error) { sendError(ws, res.error, res.error); break; }
+            sendSocial(ws);
+            break;
+        }
+
+        case 'PET_EQUIP': {
+            // {petRowId} — toggle "walk": pet sai do igloo e segue o pinguim
+            // (ou volta, se ja estiver equipado). Um pet por vez.
+            const session = clientPlayerData.get(ws);
+            if (!session || !session.playerId) {
+                sendError(ws, 'NOT_AUTHENTICATED', 'Jogador não autenticado');
+                return;
+            }
+            const petRowId = Number(data.petRowId);
+            const pet = social.getPet(session.playerId, petRowId);
+            if (!pet) { sendError(ws, 'NOT_FOUND', 'Pet não encontrado'); return; }
+            const turningOff = !!pet.equipped;
+            const res = social.setPetEquipped(session.playerId, petRowId, !turningOff);
+            if (res.error) { sendError(ws, res.error, res.error); return; }
+            // atualiza o player da sala e avisa os demais (pet aparece/some)
+            const roomPlayer = clientSessions.get(ws);
+            if (roomPlayer) {
+                roomPlayer.pet = turningOff ? null : publicPet(social.getPet(session.playerId, petRowId));
+                broadcastToRoom(roomPlayer.roomId, {
+                    op: 'PLAYER_PET',
+                    data: { playerId: session.playerId, pet: roomPlayer.pet }
+                }, ws);
+            }
+            sendSocial(ws);
+            console.log(`[PET] ${session.username} ${turningOff ? 'guardou' : 'passeou com'} ${pet.name}`);
+            break;
+        }
+
+        case 'PET_CARE': {
+            // {petRowId, action:'feed'|'play'} — restaura stats (cooldown 5s/pet)
+            const session = clientPlayerData.get(ws);
+            if (!session || !session.playerId) return;
+            const petRowId = Number(data.petRowId);
+            const pet = social.getPet(session.playerId, petRowId);
+            if (!pet) { sendError(ws, 'NOT_FOUND', 'Pet não encontrado'); return; }
+            const action = data.action;
+            // acoes granulares do card (gum/cookie/eat/bath) mapeiam pros
+            // mesmos buckets de stat: feed=hunger, play=happiness, rest=rest
+            const CARE_BUCKET = { play: 'play', rest: 'rest', bath: 'rest', feed: 'feed', eat: 'feed', cookie: 'feed', gum: 'feed' };
+            const bucket = CARE_BUCKET[action];
+            if (!bucket) { sendError(ws, 'INVALID_DATA', 'action inválida'); return; }
+            const key = `${session.playerId}:${petRowId}`;
+            const last = petCareCooldown.get(key) || 0;
+            const nowTs = Date.now();
+            if (nowTs - last < 5_000) {
+                sendError(ws, 'CARE_COOLDOWN', 'Aguarde um pouco antes de cuidar de novo');
+                return;
+            }
+            petCareCooldown.set(key, nowTs);
+            const fresh = social.getPets(session.playerId).find((p) => p.petRowId === petRowId);
+            if (!fresh) { sendError(ws, 'NOT_FOUND', 'Pet não encontrado'); return; }
+            const nh = Math.min(100, fresh.hunger + (bucket === 'feed' ? 30 : 5));
+            const np = Math.min(100, fresh.happiness + (bucket === 'play' ? 30 : 5));
+            const nr = Math.min(100, Math.max(0, fresh.rest + (bucket === 'rest' ? 30 : bucket === 'feed' ? -10 : 10)));
+            social.setPetStats(session.playerId, petRowId, nh, np, nr);
+            // avisa a sala: o puffle equipado toca a animacao do cuidado
+            // (gp usa o evento 'pcare' -> class Do.react -> frame do misc)
+            const roomSession = clientSessions.get(ws);
+            if (roomSession?.roomId) broadcastToRoom(roomSession.roomId, {
+                op: 'PLAYER_PET_CARE',
+                data: { playerId: session.playerId, petRowId, action }
+            });
+            sendSocial(ws);
             break;
         }
     }

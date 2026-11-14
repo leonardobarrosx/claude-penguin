@@ -7,6 +7,7 @@
 //   - texto dinamico: book.coinTotal.coins_txt = "YOUR COINS: N"
 import { MovieRoom } from '../movie/movie.js';
 import { PromptUI } from './Prompt.js';
+import { ADOPT_SPECIES } from '../entities/PuffleView.js';
 
 const FRAME_RATE_MS = 1000 / 24;
 
@@ -30,17 +31,6 @@ const STR = {
     not_available: 'This item is not available.',
 };
 const str = (k) => STR[k] || k;
-
-// Bandeiras do catalogo de roupas (paginas 19-20): paises (original) ou
-// estados brasileiros — variante gerada por tools/make-state-pins.mjs em
-// catalogues/clothing-br (mesmos packs; so as paginas de pins mudam).
-const FLAG_SET_KEY = 'penguin_flag_set';
-const FLAG_PAGES = new Set([19, 20]);
-function flagSet() {
-    try { return localStorage.getItem(FLAG_SET_KEY) === 'states' ? 'states' : 'countries'; }
-    catch { return 'countries'; }
-}
-const packFor = (key, set = flagSet()) => (key === 'clothing' && set === 'states' ? 'clothing-br' : key);
 
 let _itemsById = null;
 async function itemsById() {
@@ -92,7 +82,7 @@ export class CatalogueOverlay {
         // (no CP original o catalog_viewer.swf mostrava animacao de load)
         this.scene.loadingScreen?.show('Loading catalogue...', 0);
         try {
-            const movie = await MovieRoom.load(`/assets/catalogues/${packFor(key)}`);
+            const movie = await MovieRoom.load(`/assets/catalogues/${key}`);
             if (this.movie || gen !== this._generation) return;
             this.movie = movie;
             movie.artFlatScale = true; // raster fixo em ss — warm cobre tudo
@@ -114,14 +104,6 @@ export class CatalogueOverlay {
             this._buildCanvas();
             await this._show();
             this._startTick();
-            // otimista: a outra versao das bandeiras ja fica carregada —
-            // trocar paises <-> estados nao espera rede/parse
-            if (key === 'clothing') {
-                const other = packFor(key, flagSet() === 'states' ? 'countries' : 'states');
-                const warm = () => MovieRoom.load(`/assets/catalogues/${other}`).catch(() => {});
-                if (typeof requestIdleCallback === 'function') requestIdleCallback(warm, { timeout: 3000 });
-                else setTimeout(warm, 1000);
-            }
         } catch (e) {
             console.warn('[catalogue] falha ao abrir', key, e);
             this.scene._showRoomFail?.(key);
@@ -375,7 +357,6 @@ export class CatalogueOverlay {
             });
         }
         this.controls = controls;
-        this._syncFlagToggle();
         this.hovered = null;
     }
 
@@ -401,7 +382,16 @@ export class CatalogueOverlay {
     // Port direto do xo.commands — retorna funcao ou null.
     _commands(body, basePath, movie = this.movie, show = true) {
         const adopt = /adoptPuffle\((\d+)\)/.exec(body);
-        if (adopt) return () => this._notice('Puffle adoption is not available yet.');
+        // adoptPuffle(N): N indexa a ordem gp dos puffles no catalogo adopt
+        // (blue,pink,black,green,purple,red,yellow,white,orange) — o fluxo
+        // de confirmacao + nome acontece na RoomScene (prompt original)
+        if (adopt) {
+            const species = ADOPT_SPECIES[Number(adopt[1])];
+            return () => {
+                this.close();
+                if (species) this.scene.adoptPuffleFlow?.(species);
+            };
+        }
         const buy = BUY_RE.exec(body);
         if (buy) {
             const kind = BUY_KINDS[buy[1]];
@@ -566,64 +556,7 @@ export class CatalogueOverlay {
         }).catch((e) => console.warn('[prompt]', e));
     }
 
-    // Seletor "Países / Estados do Brasil" no topo do livro, so nas paginas
-    // de bandeiras do catalogo de roupas. A escolha fica salva no navegador.
-    _syncFlagToggle() {
-        const show = this.movie && this.key === 'clothing' && FLAG_PAGES.has(this.page)
-            && typeof document !== 'undefined';
-        if (!show) { this._flagToggle?.remove(); this._flagToggle = null; return; }
-        if (!this._flagToggle) {
-            const el = document.createElement('div');
-            el.className = 'cp-flagset';
-            el.style.cssText = 'position:fixed;z-index:9000;display:flex;gap:4px;padding:3px;'
-                + 'background:rgba(8,32,80,.88);border:2px solid #7fb2ec;border-radius:16px;'
-                + 'font:700 12px Arial,Helvetica,sans-serif;transform:translate(-50%,0);'
-                + 'box-shadow:0 2px 8px rgba(0,0,0,.35);user-select:none;';
-            for (const [set, label] of [['countries', 'Países'], ['states', 'Estados do Brasil']]) {
-                const b = document.createElement('button');
-                b.type = 'button';
-                b.dataset.set = set;
-                b.textContent = label;
-                b.style.cssText = 'border:0;border-radius:12px;padding:4px 11px;cursor:pointer;font:inherit;';
-                b.addEventListener('click', (ev) => {
-                    ev.stopPropagation();
-                    if (flagSet() === set) return;
-                    try { localStorage.setItem(FLAG_SET_KEY, set); } catch { /* sem storage */ }
-                    this.open('clothing_catalogue', { page: this.page });
-                });
-                el.appendChild(b);
-            }
-            // clique no seletor nao vira clique no livro/sala
-            el.addEventListener('pointerdown', (ev) => ev.stopPropagation());
-            document.body.appendChild(el);
-            this._flagToggle = el;
-            this._onFlagResize = () => this._layoutFlagToggle();
-            window.addEventListener('resize', this._onFlagResize);
-        }
-        const cur = flagSet();
-        for (const b of this._flagToggle.querySelectorAll('button')) {
-            const on = b.dataset.set === cur;
-            b.style.background = on ? '#ffcc33' : 'transparent';
-            b.style.color = on ? '#102a5c' : '#dfe9f7';
-        }
-        this._layoutFlagToggle();
-    }
-
-    _layoutFlagToggle() {
-        const el = this._flagToggle;
-        const canvas = this.scene.game?.canvas;
-        if (!el || !canvas) return;
-        const r = canvas.getBoundingClientRect();
-        // topo do livro, sobre a lombada (coords de mundo 380,2)
-        el.style.left = `${r.left + (380 / 760) * r.width}px`;
-        el.style.top = `${r.top + (2 / 480) * r.height}px`;
-    }
-
     close() {
-        this._flagToggle?.remove();
-        this._flagToggle = null;
-        if (this._onFlagResize) window.removeEventListener('resize', this._onFlagResize);
-        this._onFlagResize = null;
         this._generation++;
         this._prompt?.close();
         this._stopTick();

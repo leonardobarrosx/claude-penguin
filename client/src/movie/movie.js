@@ -14,33 +14,13 @@ let _packDbPromise = null;
 function packDb() {
     if (!_packDbPromise) {
         _packDbPromise = new Promise((resolve, reject) => {
-            // v2: descarta tudo que a v1 gravou. Com os .pack convertidos para
-            // CRLF no checkout (Git/Windows) a v1 cacheava buffers corrompidos
-            // "para sempre" (chave = URL imutavel) — mesmo com os arquivos
-            // corrigidos no disco o browser seguia servindo os ruins.
-            const req = indexedDB.open('penguin-packs', 2);
-            req.onupgradeneeded = () => {
-                const db = req.result;
-                if (db.objectStoreNames.contains('chunks')) db.deleteObjectStore('chunks');
-                db.createObjectStore('chunks');
-            };
-            req.onsuccess = () => {
-                const db = req.result;
-                // outra aba pedindo upgrade: fecha para nao bloquea-la
-                db.onversionchange = () => db.close();
-                resolve(db);
-            };
+            const req = indexedDB.open('penguin-packs', 1);
+            req.onupgradeneeded = () => req.result.createObjectStore('chunks');
+            req.onsuccess = () => resolve(req.result);
             req.onerror = () => reject(req.error);
-            // aba antiga com a v1 aberta: segue sem cache nesta sessao
-            req.onblocked = () => reject(new Error('penguin-packs: upgrade bloqueado'));
         });
     }
     return _packDbPromise;
-}
-function packDel(key) {
-    packDb().then((db) => {
-        db.transaction('chunks', 'readwrite').objectStore('chunks').delete(key);
-    }).catch(() => {});
 }
 async function packGet(url) {
     try {
@@ -231,25 +211,15 @@ export class MovieRoom {
         });
         const packs = [];
         const urls = [];
-        // `file` pode ser um caminho relativo (ex.: '../../clothing/chars/x.pack'):
-        // variantes de um pacote (catalogues/clothing-br) reaproveitam os
-        // packs do original sem duplica-los — o pack e identificado pelo
-        // `file` exato do manifest, nao pelo nome final
-        const fileOfUrl = new Map();
-        const addFile = (f) => {
-            const u = `${base}/chars/${f}`;
-            if (!fileOfUrl.has(u)) { fileOfUrl.set(u, f); urls.push(u); }
-            return u;
-        };
-        const charsUrl = tl.pack?.file ? addFile(tl.pack.file) : null;
-        for (const f of tl.chunks?.files ?? []) addFile(f);
+        const charsUrl = tl.pack?.file ? `${base}/chars/${tl.pack.file}` : null;
+        if (charsUrl) urls.push(charsUrl);
+        for (const f of tl.chunks?.files ?? []) urls.push(`${base}/chars/${f}`);
         // chars.pack nao tem hash no nome: cacheia no IDB com chave
         // url@source — source muda quando os assets sao regerados
         const srcKey = tl.source || '';
-        const cacheKeyOf = (u) => (u === charsUrl ? `${u}@${srcKey}` : undefined);
         await Promise.all(urls.map(async (u) => {
-            const buf = await fetchPack(u, cacheKeyOf(u));
-            packs.push({ name: fileOfUrl.get(u), buf });
+            const buf = await fetchPack(u, u === charsUrl ? `${u}@${srcKey}` : undefined);
+            packs.push({ name: u.split('/').pop(), buf });
         }));
 
         // indice arquivo -> {pack, off, len}
@@ -265,29 +235,6 @@ export class MovieRoom {
             // entries: [chunkIndex, offset, length] ou [offset, length]
             if (e.length === 3) files.set(file, { pack: chunkFiles[e[0]], off: e[1], len: e[2] });
             else files.set(file, { pack: chunkFiles[0], off: e[0], len: e[1] });
-        }
-
-        // Integridade: os offsets do manifest sao em BYTES do pack original
-        // (LF). Se o pack foi alterado no caminho (ex.: checkout do Git no
-        // Windows convertendo LF->CRLF) todo SVG sai cortado no meio, nenhum
-        // decodifica e a sala/HUD/pinguim renderizam vazios — tela preta sem
-        // nenhum erro no console. Todo .svg comeca com '<': se algum nao
-        // comecar, falha alto e purga o cache em vez de desenhar nada.
-        const views = new Map();
-        let bad = null;
-        for (const [file, ref] of files) {
-            if (!ref.pack || !ref.len) continue;
-            if (ref.off + ref.len > ref.pack.buf.byteLength) { bad = file; break; }
-            if (!file.endsWith('.svg')) continue;
-            let u8 = views.get(ref.pack);
-            if (!u8) views.set(ref.pack, (u8 = new Uint8Array(ref.pack.buf)));
-            if (u8[ref.off] !== 0x3c) { bad = file; break; }
-        }
-        if (bad) {
-            for (const u of urls) packDel(cacheKeyOf(u) ?? u);
-            throw new Error(
-                `pack corrompido: offset de "${bad}" nao bate com o manifest `
-                + '(.pack com fim de linha convertido para CRLF? veja .gitattributes)');
         }
 
         // parse AS das interacoes uma vez — deterministico a partir do tl
@@ -361,10 +308,11 @@ export class MovieRoom {
         room._skipDynamic = null;      // paths de sprites animados (overlays)
         room._scale = 1;
         room.language = 'english';    // clips de idioma ficam estaticos no frame do idioma
-        room._mainTl = { frames: tl.main?.frames ?? [[]], labels: tl.main?.labels ?? {}, actions: tl.main?.actions ?? {} };
+        room._mainTl = { frames: tl.main?.frames ?? [[]], labels: tl.main?.labels ?? {}, actions: tl.main?.actions ?? {}, sounds: tl.main?.sounds ?? [] };
         room._mainFrame = 1;          // frame atual da timeline principal (1-based; catalogos = paginas)
         room._state = new Map();      // path -> {visible?, text?, entryId?} (set() do Clip do gp)
         room._nodes = new Map();      // path -> {entry, matrix} do ultimo collectInteractive
+        room._sndQueue = null;         // ids de som de timeline "entrados" — null = sons desligados (sem leak em salas)
         room.editTexts = tl.editTexts || {};
         room.fonts = tl.fonts || {};
         room.scalingGrids = tl.scalingGrids || {};
@@ -381,7 +329,7 @@ export class MovieRoom {
     //   disabled    = Set<path> (useHandCursor=false)
     // Port simplificado do parser 'ti/as' do bundle gopenguin.
     _parseInteractions() {
-        const ci = { click: {}, trigContent: {}, trigGame: {}, trigTable: {}, disabled: new Set() };
+        const ci = { click: {}, trigContent: {}, trigGame: {}, trigTable: {}, hint: {}, disabled: new Set() };
         const sources = [];
         const collect = (acts) => {
             for (const a of Object.values(acts || {})) {
@@ -399,12 +347,12 @@ export class MovieRoom {
             if (sc) return { content: sc[1] };
             const gm = /send(?:Join)?Game\(\s*["']([\w-]+)["']/.exec(body);
             if (gm) return { game: gm[1] };
+            const tb = /sendJoinTable\(\s*["'](\w+)["']\s*,\s*(\d+)/.exec(body);
+            if (tb) return { table: { game: tb[1], id: Number(tb[2]) } };
+            const wd = /sendJoinWaddle\(\s*["'](\w+)["']\s*,\s*(\d+)/.exec(body);
+            if (wd) return { table: { game: wd[1], id: Number(wd[2]) } };
             const jr = /sendJoinRoom\(\s*["']([\w-]+)["']\s*,\s*(\d+)\s*,\s*(\d+)\s*\)/.exec(body);
             if (jr) return { room: jr[1], x: Number(jr[2]), y: Number(jr[3]) };
-            // mesas (Find Four, Mancala) e waddles (Card-Jitsu, trenó):
-            // ENGINE.sendJoinTable("mancala",100,true)
-            const jt = /sendJoin(Table|Waddle)\(\s*["']([\w-]+)["']\s*,\s*(\d+)/.exec(body);
-            if (jt) return { table: { kind: jt[1].toLowerCase(), game: jt[2], id: Number(jt[3]) } };
             return null;
         };
 
@@ -423,6 +371,14 @@ export class MovieRoom {
                 if (act?.content) ci.trigContent[m[1]] = act.content;
                 else if (act?.game) ci.trigGame[m[1]] = act.game;
                 else if (act?.table) ci.trigTable[m[1]] = act.table;
+            }
+            // path.onRollOver = function() { INTERFACE.showHint(this,"x_hint"); }
+            const reOver = /([\w.]+)\.onRollOver\s*=\s*function\s*\(\s*\)\s*\{([\s\S]*?)\}/g;
+            while ((m = reOver.exec(src))) {
+                const h = /showHint\([^,]+,\s*["']([\w-]+)["']\)/.exec(m[2]);
+                // 'mc.game_btn' e parametro do setupTable(mc), nao path real —
+                // o sufixo 'game_btn' casaria com TODAS as mesas da sala
+                if (h && !m[1].startsWith('mc.')) ci.hint[m[1]] = h[1];
             }
             // path.useHandCursor = false -> nao interativo
             const reDis = /([\w.]+)\.useHandCursor\s*=\s*false/g;
@@ -784,6 +740,7 @@ export class MovieRoom {
             }
             h.frame = next;
             this._entered.set(h.path, next);
+            this._emitSounds(h.tl, next, h);
             for (const c of this._actions(h.tl, next)) {
                 const op = c[0], arg = c[1];
                 if (op === 'stop') h.stopped = true;
@@ -793,6 +750,7 @@ export class MovieRoom {
                     if (f) {
                         h.frame = f;
                         h.stopped = op === 'gotoAndStop';
+                        this._emitSounds(h.tl, f, h);
                         // NAO registra o destino do salto em _entered: o
                         // frame "avancado" (ex.: puffle 237) e o que o
                         // watch precisa observar; o gotoAndStop(1) e acao
@@ -845,6 +803,35 @@ export class MovieRoom {
         // (botao/texto dentro de sprite animado) tambem precisam re-render
         this._dirtyForcedPaths = new Set(this._forcedPaths);
         this._forcedPaths.clear();
+        this._sweepOrphanSounds();
+    }
+
+    // No Flash, quando o frame do pai troca, a instancia filha e destruida
+    // e seus sons morrem junto. Nossos playheads sobrevivem orfaos em
+    // _playheadAll — ex.: sprite 214 (raio do electro do penguin) manda
+    // _parent.gotoAndStop(1) no frame 19, o penguin volta ao 'sit' sem o
+    // filho, e o playhead ficava ciclando 1->19->1 re-emitindo o som do
+    // frame 1 para sempre. Calcula os paths vivos na display list uma vez
+    // por tick e muta os orfaos: eles seguem avancando (barato, e se o pai
+    // voltar ao frame certo o som volta a funcionar) mas nao emitem mais.
+    _sweepOrphanSounds() {
+        const heads = new Map();
+        for (const h of this._playheadAll.values())
+            heads.set(h.path + '' + String(h.sid), h);
+        const live = new Set();
+        const walkLive = (entries, path) => {
+            for (const e of entries || []) {
+                const sid = String(e.id);
+                if (!this.sprites[sid]) continue;
+                const cp = this._path(path, e);
+                live.add(cp);
+                const hh = heads.get(cp + '' + sid);
+                if (hh) walkLive(hh.tl.frames[hh.frame - 1], cp);
+            }
+        };
+        walkLive(this._mainTl.frames[this._mainFrame - 1] || [], '');
+        for (const h of this._playheadAll.values())
+            h.muted = !live.has(h.path);
     }
 
     _playhead(path, tlId) {
@@ -858,7 +845,7 @@ export class MovieRoom {
         const key = path + '' + tlId;
         let h = this._playheadAll.get(key);
         if (!h) {
-            h = { tl, frame: 1, stopped: false, path };
+            h = { tl, frame: 1, stopped: false, path, sid: tlId };
             // clips de idioma (letreiros): frames segmentados por idioma,
             // o script original faz gotoAndStop(language) — fixamos o frame
             const langs = ['english', 'portuguese', 'french', 'spanish'];
@@ -867,6 +854,7 @@ export class MovieRoom {
                 h.stopped = true;
                 this._playheadAll.set(key, h);
                 this._playheads.set(path, h);
+                this._emitSounds(tl, h.frame, h); // som do frame inicial toca na entrada (Flash)
                 return h;
             }
             // ações do frame inicial executam ao entrar (ex.: stop() no frame 1)
@@ -878,6 +866,7 @@ export class MovieRoom {
                 }
             }
             this._playheadAll.set(key, h);
+            this._emitSounds(tl, h.frame, h); // idem: frame inicial pode ter StartSound
         }
         this._playheads.set(path, h);
         return h;
@@ -914,7 +903,9 @@ export class MovieRoom {
         if (!h) return false;
         const f = typeof frame === 'string' ? this._labelFrame(h.tl, frame) : Number(frame);
         if (!f) return false;
-        h.frame = Math.max(1, Math.min(f, h.tl.frames.length || 1));
+        const nf = Math.max(1, Math.min(f, h.tl.frames.length || 1));
+        if (nf !== h.frame) this._emitSounds(h.tl, nf, h);
+        h.frame = nf;
         h.stopped = !playing;
         this._markRoot(path);
         return true;
@@ -1034,39 +1025,54 @@ export class MovieRoom {
             p[2] - (p[2] - grid[2]) * w / local.a, p[2]];
         const C = [p[1], p[1] + (grid[1] - p[1]) * S / local.d,
             p[3] - (p[3] - grid[3]) * S / local.d, p[3]];
-        // device rect da fatia (world axis-aligned pois local e os pais sao)
-        const devRect = (rx, ry, rw, rh) => {
+        // Renderiza o frame UMA vez numa canvas offscreen e fatia o bitmap
+        // em 9 drawImages — a versao anterior re-renderizava o vetor por
+        // fatia com clip fracionario e abria gap de ~1px nas emendas
+        // (visivel no prompt_mc e demais paineis 9-slice).
+        // Fonte de cada fatia = celula da GRADE (b/v) no render NAO-esticado
+        // (parent = world * inv(local)); destino = celula x/C sob world
+        // (com o stretch). Renderizar com world direto esticava as margens.
+        const devRectM = (m, rx, ry, rw, rh) => {
             const pts = [[rx, ry], [rx + rw, ry], [rx, ry + rh], [rx + rw, ry + rh]]
                 .map(([px, py]) => [
-                    world.a * px + world.c * py + world.x,
-                    world.b * px + world.d * py + world.y,
+                    m.a * px + m.c * py + m.x,
+                    m.b * px + m.d * py + m.y,
                 ]);
             const xs = pts.map((q) => q[0]), ys = pts.map((q) => q[1]);
             return [Math.min(...xs), Math.min(...ys),
                 Math.max(...xs) - Math.min(...xs), Math.max(...ys) - Math.min(...ys)];
         };
+        // parent = world * inv(local): matrix do pai sem o transform da
+        // instancia (local e axis-aligned: b=c=0, garantido pelo caller)
+        const parent = matMul(world, {
+            a: 1 / local.a, b: 0, c: 0, d: 1 / local.d,
+            x: -local.x / local.a, y: -local.y / local.d,
+        });
+        // devRectM retorna [x, y, w, h] — nw/nh sao w/h, nao coords
+        const [nx0, ny0, nw, nh] = devRectM(parent, p[0], p[1], p[2] - p[0], p[3] - p[1]);
+        // L: supersample extra para a celula central, que no destino e
+        // ampliada por local.a/local.d — sem isso o bitmap nativo (parent)
+        // fica menos nitido que o render vetorial por fatia do algoritmo
+        // original. Margens viram downscale (mais nitidas, sem custo
+        // visual). Cap em 3 para nao explodir memoria em zooms extremos.
+        const L = Math.min(3, Math.max(Math.abs(local.a), Math.abs(local.d), 1));
+        const fw = Math.max(1, Math.ceil(nw * L)), fh = Math.max(1, Math.ceil(nh * L));
+        const off = document.createElement('canvas');
+        off.width = fw; off.height = fh;
+        const octx = off.getContext('2d');
+        const mOff = { a: parent.a * L, b: parent.b * L, c: parent.c * L, d: parent.d * L,
+            x: (parent.x - nx0) * L, y: (parent.y - ny0) * L };
+        await this._drawEntries(octx, frame, mOff, path, color, scale, depth + 1);
         for (let r = 0; r < 3; r++) {
             for (let cIdx = 0; cIdx < 3; cIdx++) {
                 const P = x[cIdx + 1] - x[cIdx], I = C[r + 1] - C[r];
                 if (P <= 0 || I <= 0 || b[cIdx + 1] === b[cIdx] || v[r + 1] === v[r]) continue;
-                // transform da fatia no espaco do simbolo:
-                // p -> (x[c] + (px - b[c]) * P/(b[c+1]-b[c]), C[r] + (py - v[r]) * I/(v[r+1]-v[r]))
-                const kx = P / (b[cIdx + 1] - b[cIdx]);
-                const ky = I / (v[r + 1] - v[r]);
-                const t = {
-                    a: kx, b: 0, c: 0, d: ky,
-                    x: x[cIdx] - b[cIdx] * kx,
-                    y: C[r] - v[r] * ky,
-                };
-                const mSlice = matMul(world, t);
-                const [dx, dy, dw, dh] = devRect(x[cIdx], C[r], P, I);
-                if (dw <= 0 || dh <= 0) continue;
-                ctx.save();
-                ctx.beginPath();
-                ctx.rect(dx, dy, dw, dh);
-                ctx.clip();
-                await this._drawEntries(ctx, frame, mSlice, path, color, scale, depth + 1);
-                ctx.restore();
+                // src: celula da grade (b/v) no render nativo (mOff);
+                // dst: celula de destino (x/C) sob world (com stretch)
+                const s = devRectM(mOff, b[cIdx], v[r], b[cIdx + 1] - b[cIdx], v[r + 1] - v[r]);
+                const d = devRectM(world, x[cIdx], C[r], P, I);
+                if (s[2] <= 0 || s[3] <= 0 || d[2] <= 0 || d[3] <= 0) continue;
+                ctx.drawImage(off, s[0], s[1], s[2], s[3], d[0], d[1], d[2], d[3]);
             }
         }
     }
@@ -1240,7 +1246,11 @@ export class MovieRoom {
 
     topLevelLayers() {
         const frame = this._mainTl.frames[0] || [];
-        const SKIP = new Set(['block_mc', 'triggers_mc']);
+        // block/triggers nunca renderizam; os *_area do igloo sao
+        // marcadores de debug do SWF (parede p/ moveis, area do pet,
+        // piso) — no original sao invisiveis, aqui viravam manchas coloridas
+        const SKIP = new Set(['block_mc', 'triggers_mc',
+            'trash_area', 'room_area', 'wall_area', 'pet_area', 'waypointsClip']);
         return frame
             .filter((e) => !SKIP.has(e.name))
             .map((e) => ({ entry: e, z: this._depthOf(e) }))
@@ -1552,7 +1562,9 @@ export class MovieRoom {
         const f = typeof frame === 'string' ? this._labelFrame(this._mainTl, frame) : Number(frame);
         if (p === '') {
             if (!f) return false;
-            this._mainFrame = Math.max(1, Math.min(f, this._mainTl.frames.length || 1));
+            const nf = Math.max(1, Math.min(f, this._mainTl.frames.length || 1));
+            if (nf !== this._mainFrame) this._emitSounds(this._mainTl, nf);
+            this._mainFrame = nf;
             this._dirty = true;
             this._markRoot('');
             return true;
@@ -1564,10 +1576,29 @@ export class MovieRoom {
         let h = this._playheads.get(r.path);
         if (!h) h = this._playhead(r.path, r.id);
         if (!h) return false;
-        h.frame = Math.max(1, Math.min(ff, h.tl.frames.length || 1));
+        const nf = Math.max(1, Math.min(ff, h.tl.frames.length || 1));
+        if (nf !== h.frame) this._emitSounds(h.tl, nf, h);
+        h.frame = nf;
         h.stopped = !playing;
         this._markRoot(r.path);
         return true;
+    }
+
+    // Sons de timeline do SWF (StartSound): tl.sounds = [{frame, ids, starts}].
+    // Enfileira os ids dos sons do frame "entrado" — quem consome (ex.:
+    // IceFishingGame) mapeia id -> arquivo e toca. drainSounds() esvazia.
+    _emitSounds(tl, frame, h) {
+        const list = tl?.sounds;
+        if (!list?.length || !this._sndQueue || h?.muted) return;
+        for (const s of list)
+            if (s.frame === frame)
+                for (const id of s.ids || []) this._sndQueue.push(id);
+    }
+
+    drainSounds() {
+        const q = this._sndQueue || [];
+        this._sndQueue = [];
+        return q;
     }
 
     currentFrame(path) {
@@ -1849,6 +1880,40 @@ export class MovieRoom {
         for (const t of this._triggers || []) {
             if (this._gridHit(t.grid, x, y, this._colScale))
                 return { room: t.room, x: t.x, y: t.y, content: t.content, game: t.game, table: t.table };
+        }
+        return null;
+    }
+
+    // Centroide da zona de trigger `name` em coords de mundo — usado como
+    // alvo de caminhada das mesas (o centro do game_btn nem sempre cai
+    // dentro da zona, ex.: table205 do lodge).
+    triggerCenter(name) {
+        const t = (this._triggers || []).find((tr) => tr.name === name);
+        if (!t?.grid) return null;
+        const s = this._colScale || 1;
+        let sx = 0, sy = 0, n = 0;
+        const { data, w, h } = t.grid;
+        for (let y = 0; y < h; y++) {
+            for (let x = 0; x < w; x++) {
+                if (data[y * w + x] === 1) { sx += x; sy += y; n++; }
+            }
+        }
+        return n ? [Math.round(sx / n / s), Math.round(sy / n / s)] : null;
+    }
+
+    // Ponto livre mais proximo (sem trigger/bloqueio) — tira o pinguim da
+    // area da mesa ao fim da partida para nao travar a mesa p/ outros.
+    findFreePoint(x, y, maxR = 140) {
+        const ok = (ex, ey) =>
+            ex >= 20 && ex <= 740 && ey >= 20 && ey <= 430
+            && !this.triggerAt(ex, ey) && !this.hitBlock(ex, ey);
+        if (ok(x, y)) return { x, y };
+        for (let r = 8; r <= maxR; r += 8) {
+            for (let a = 0; a < 16; a++) {
+                const ex = Math.round(x + r * Math.cos((a * Math.PI) / 8));
+                const ey = Math.round(y + r * Math.sin((a * Math.PI) / 8));
+                if (ok(ex, ey)) return { x: ex, y: ey };
+            }
         }
         return null;
     }

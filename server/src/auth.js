@@ -1,87 +1,78 @@
 /**
- * auth.js - Identificação de jogadores.
- *
- * Estratégia atual (fase 2):
- *  - sessionToken do cliente -> tabela `sessions` (contas e guests)
- *  - fallback legado: players.session_token (tokens antigos ainda
- *    válidos até o prazo de migração — ver meta.legacy_token_deadline)
- *
- * Removido: reconhecimento automático por IP (qualquer visitante ganhava
- * a conta do último jogador daquele IP).
+ * auth.js - Identificação de jogadores sem login
+ * Estratégia: cookie HttpOnly -> localStorage token -> IP fallback
  */
 
-import db from './db.js';
+import crypto from 'crypto';
 import playerStore from './playerStore.js';
-import * as accounts from './accounts.js';
-import { clientIp } from './net.js';
-import { WORLD_ID } from './worlds.js';
-
-const { legacyDeadline, legacyGraceActive } = accounts;
+import { clientIp, isLoopbackIp } from './net.js';
 
 const COOKIE_NAME = 'penguin_session';
 const COOKIE_MAX_AGE = 30 * 24 * 60 * 60; // 30 dias
 
-// Prazo para contas antigas definirem senha (gravado na migração 3).
-export { legacyDeadline, legacyGraceActive };
-
 /**
- * Resolve um session token do cliente.
- * Retorna { player, sessionToken, via } ou null.
- * `via` = 'session' (tabela sessions) | 'legacy' (players.session_token).
+ * Extrai o session token do cookie ou de um query param (para localStorage fallback)
  */
-export function resolveToken(clientToken, req = null) {
-    if (!clientToken) return null;
-
-    // 1. Sessão nova (contas e guests pós-fase-2)
-    const resolved = accounts.resolveSession(clientToken);
-    if (resolved) {
-        const player = playerStore.getPlayerById(resolved.playerId);
-        if (player) {
-            playerStore.touchPlayer(player.player_id);
-            return { player, sessionToken: clientToken, via: 'session' };
-        }
-        accounts.revokeSession(clientToken);
-    }
-
-    // 2. Token legado (players.session_token) — só até o prazo de migração
-    if (Date.now() < legacyDeadline()) {
-        const player = playerStore.getPlayerBySession(clientToken);
-        if (player) {
-            playerStore.touchPlayer(player.player_id);
-            return { player, sessionToken: clientToken, via: 'legacy' };
+function extractSessionToken(req) {
+    // 1. Tenta cookie
+    const cookieHeader = req.headers.cookie;
+    if (cookieHeader) {
+        const cookies = cookieHeader.split(';').reduce((acc, c) => {
+            const [key, val] = c.trim().split('=');
+            acc[key] = val;
+            return acc;
+        }, {});
+        if (cookies[COOKIE_NAME]) {
+            return cookies[COOKIE_NAME];
         }
     }
+
+    // 2. Tenta query param (o cliente pode enviar o token do localStorage aqui)
+    // O WebSocket não tem query params fáceis, então o cliente pode enviar no primeiro pacote
+    // Por enquanto, retornamos null e o cliente envia via mensagem
     return null;
 }
 
 /**
- * Cria sessão para o jogador e devolve o token cru (vai ao cliente).
- */
-export function issueSession(player, req = null) {
-    const ip = req ? clientIp(req) : null;
-    const ua = req?.headers?.['user-agent'] || null;
-    return accounts.createSession(player.player_id, ip, ua, WORLD_ID);
-}
-
-/**
- * Identifica jogador por token; se não achar, retorna { player: null, ip }
- * para o fluxo de guest criar uma conta nova.
+ * Identifica ou cria um jogador baseado na requisição
+ * Retorna { player, isNew, sessionToken }
  */
 export function identifyPlayer(req, clientToken = null) {
     const ip = clientIp(req) || 'unknown';
-    const resolved = resolveToken(clientToken, req);
-    if (resolved) {
-        return { player: resolved.player, isNew: false, sessionToken: resolved.sessionToken, via: resolved.via };
+
+    // 1. Tenta por session token (cookie ou localStorage)
+    const sessionToken = clientToken || extractSessionToken(req);
+    if (sessionToken) {
+        const player = playerStore.getPlayerBySession(sessionToken);
+        if (player) {
+            playerStore.touchPlayer(player.player_id);
+            return { player, isNew: false, sessionToken };
+        }
     }
+
+    // 2. Tenta por IP (fallback) — ignorado em localhost para permitir
+    // varios pinguins de teste na mesma maquina (todos compartilham ::1)
+    const isLoopback = isLoopbackIp(ip);
+    const playerByIp = isLoopback ? null : playerStore.getPlayerByIp(ip);
+    if (playerByIp) {
+        // Se encontrou por IP mas não tem token, gera um novo
+        const newToken = crypto.randomBytes(32).toString('hex');
+        playerStore.updatePlayerSession(playerByIp.player_id, newToken);
+        playerStore.touchPlayer(playerByIp.player_id);
+        const updated = playerStore.getPlayerById(playerByIp.player_id);
+        return { player: updated, isNew: false, sessionToken: newToken };
+    }
+
+    // 3. Nenhum jogador encontrado - precisa criar
     return { player: null, isNew: true, sessionToken: null, ip };
 }
 
 /**
- * Cria um novo jogador (guest) e já emite sessão na tabela sessions.
+ * Cria um novo jogador e retorna o session token
  */
-export function createNewPlayer(ip, username, colorItemId = 1, req = null) {
+export function createNewPlayer(ip, username, colorItemId = 1) {
     const player = playerStore.createPlayer(ip, username, colorItemId);
-    const sessionToken = issueSession(player, req);
+    const sessionToken = player.session_token;
     return { player, sessionToken };
 }
 
@@ -99,15 +90,10 @@ export function applyDailyBonusIfNeeded(playerId) {
     return playerStore.applyDailyBonus(playerId);
 }
 
-export { accounts };
-
 export default {
     identifyPlayer,
     createNewPlayer,
-    resolveToken,
-    issueSession,
     buildSessionCookie,
     applyDailyBonusIfNeeded,
-    legacyDeadline,
     COOKIE_NAME
 };

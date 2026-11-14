@@ -16,6 +16,7 @@ import { PenguinLibrary } from '../entities/PenguinArt.js';
 import Wardrobe from '../ui/Wardrobe.js';
 import ActionControls from '../ui/ActionControls.js';
 import { MovieRoom } from '../movie/movie.js';
+import { Clip } from '../movie/clip.js';
 import PlayerCard from '../ui/PlayerCard.js';
 import IslandMap from '../ui/IslandMap.js';
 import VectorHud from '../ui/VectorHud.js';
@@ -23,16 +24,16 @@ import LoadingScreen from '../ui/LoadingScreen.js';
 import { musicPlayer } from '../audio/MusicPlayer.js';
 import CreatePlayerModal from '../ui/CreatePlayerModal.js';
 import NameChangeModal from '../ui/NameChangeModal.js';
-import AuthModal from '../ui/AuthModal.js';
-import { RecoveryCodeModal, SetPasswordModal } from '../ui/AccountModals.js';
-import ModMenu from '../ui/ModMenu.js';
-import ModPanel from '../ui/ModPanel.js';
-import GamePanel from '../ui/GamePanel.js';
 import { colorItemToRgb, DEFAULT_COLOR_ITEM_ID } from '../items/colors.js';
 import { WORLD_W, WORLD_H, computeSupersample } from '../display.js';
 import { RoomInteractions } from '../room/RoomInteractions.js';
 import { CatalogueOverlay } from '../ui/Catalogue.js';
 import { MinigameOverlay } from '../minigames/MinigameOverlay.js';
+import BuddyWindow from '../ui/BuddyWindow.js';
+import { PromptUI } from '../ui/Prompt.js';
+import PuffleView, { ADOPT_SPECIES } from '../entities/PuffleView.js';
+import PuffleCard from '../ui/PuffleCard.js';
+import PetNameModal from '../ui/PetNameModal.js';
 import TableGames from '../minigames/tables/TableGames.js';
 import { mark } from '../perf.js';
 import { MOVIE_ROOM_MAP, movieBaseFor } from '../room/rooms.js';
@@ -51,7 +52,7 @@ const ROOM_NAMES = {
     pet: 'Pet Shop', cave: 'Cave', stage: 'Stage', forest: 'Forest',
     light: 'Lighthouse', ship: 'Ship', village: 'Village', attic: 'Attic',
     dojoext: 'Dojo', cavemine: 'Mine', mtn: 'Mountain', cove: 'Cove',
-    shack: 'Mine Shack', berg: 'Iceberg'
+    shack: 'Mine Shack', berg: 'Iceberg', igloo: 'Igloo'
 };
 
 export default class RoomScene extends Phaser.Scene {
@@ -92,13 +93,6 @@ export default class RoomScene extends Phaser.Scene {
         this._playerReady = false;
         this.createPlayerModal = new CreatePlayerModal(this);
         this.nameChangeModal = new NameChangeModal(this);
-        this.authModal = new AuthModal(this);
-        this.recoveryCodeModal = new RecoveryCodeModal();
-        this.setPasswordModal = new SetPasswordModal(this);
-        this.modMenu = new ModMenu(this);
-        this.gamePanel = new GamePanel(this);
-        this._pwPromptShown = false;
-        this._lastChat = null; // último chat de outro jogador (para denúncia)
 
         // Boot: a tela do logo (BootScene) continua — sem loader intermediario
         this.loadingScreen?.showBoot();
@@ -148,6 +142,10 @@ export default class RoomScene extends Phaser.Scene {
             const btnDest = this._interactions?.clickTarget(wx, wy);
             if (btnDest?.content) { this.openContent(btnDest.content); return; }
             if (btnDest?.game) { this._showGameUnavailable(btnDest.game); return; }
+            // porta do iglu: onRelease do SWF so faz sendPlayerMove(250,270)
+            // — a saida e nossa: andar ate a porta teleporta de volta
+            const iglooDoor = this.currentRoom === 'igloo'
+                && btnDest && btnDest.x === 250 && btnDest.y === 270;
 
             if (wy > (this.gpHud ? this.gpHud.blockY : height - 60)) return;
             const hits = this.input.hitTestPointer(pointer)
@@ -159,8 +157,17 @@ export default class RoomScene extends Phaser.Scene {
             if (this.chatInputRef && document.activeElement === this.chatInputRef)
                 this.chatInputRef.blur();
 
-            // clique em cima de um pinguim abre o player card (nao anda)
-            const clicked = this._penguinAt(wx, wy);
+            // clique em cima de um pinguim abre o player card (nao anda).
+            // Botoes de cenario (mesas, portas) tem prioridade — sem isso um
+            // pinguim parado atras da mesa "roubava" o clique da mesa.
+            // puffle card SO existe dentro do iglu (pets vagando la).
+            // Fora do iglu o puffle equipado nao abre card nenhum —
+            // clicar nele abre o player card do dono (doll com o pet)
+            const puffle = this.currentRoom === 'igloo' ? this._iglooPetAt(wx, wy) : null;
+            if (puffle) { this.puffleCard?.open(puffle.pet); return; }
+            const petOwner = this._petFollowerAt(wx, wy);
+            if (petOwner) { this.playerCard.open(petOwner); return; }
+            const clicked = btnDest ? null : this._penguinAt(wx, wy);
             if (clicked) { this.playerCard.open(clicked); return; }
             const targetX = btnDest ? btnDest.x : Math.round(wx);
             const targetY = btnDest ? btnDest.y : Math.round(wy);
@@ -189,7 +196,9 @@ export default class RoomScene extends Phaser.Scene {
                 if (exit?.table) { this.openTable(exit.table); return; }
                 if (exit && exit.room && MOVIE_ROOM_MAP[exit.room] && exit.room !== this.currentRoom) {
                     this.changeRoom(exit.room, exit.x, exit.y);
+                    return;
                 }
+                if (iglooDoor && this.currentRoom === 'igloo') this._leaveIgloo();
             });
             this.network.sendMove(dest.x, dest.y);
         });
@@ -210,6 +219,42 @@ export default class RoomScene extends Phaser.Scene {
         this.playerCard = new PlayerCard(this);
         this.wardrobe = new Wardrobe(this);
         this.wardrobe.onClose = () => { this.clothesOpen = false; };
+        // 6d. Buddy List vetorial (interface_mc.widgets_mc.buddy_mc)
+        this.buddyWindow = new BuddyWindow(this);
+        // 6f. Pets: card do pet, seguidores na sala e puffles do iglu
+        this.puffleCard = new PuffleCard(this);
+        this.petNameModal = new PetNameModal(this);
+        this.petViews = new Map(); // ownerPlayerId -> PuffleView
+        this.iglooPetViews = new Map(); // petRowId -> PuffleView (wander no iglu)
+        this._iglooReturn = null; // sala de origem ao entrar no iglu
+        // 6e. Prompt autenticico (interface_mc.prompt_mc) — requests de buddy
+        this.promptUI = new PromptUI(this);
+        this.events.on('buddy-request', (d) => {
+            this.promptUI.show({
+                text: `${d.fromUsername || 'Someone'} has asked to be your buddy. Do you accept?`,
+                mode: 'yesno',
+                onYes: () => this.network?.buddyAccept(d.fromPlayerId),
+                onNo: () => {},
+            });
+        });
+        this.events.on('buddy-request-sent', () => {
+            this.promptUI.show({ text: 'Request Sent', mode: 'ok', onYes: () => {} });
+        });
+        this.events.on('buddy-accepted', (d) => {
+            this.promptUI.show({
+                text: `${d.buddyUsername || 'Someone'} is now your buddy!`,
+                mode: 'ok',
+                onYes: () => {},
+            });
+        });
+        // buddy/ignore/pet mudaram -> atualiza os frames do card aberto
+        // e repinta a doll (puffle equipado aparece/some no card)
+        this.events.on('social-update', () => {
+            this.playerCard?._syncSocialFrames?.();
+            this.playerCard?._refresh?.();
+            this._syncLocalPet();
+            this._syncIglooPets();
+        });
 
         // 7. Modal do Mapa da Ilha e guarda-roupa
         this.createMapModal();
@@ -218,7 +263,7 @@ export default class RoomScene extends Phaser.Scene {
         // 8. Entrada na sala (aguarda player-data)
         this.events.on('net-connected', () => {
             if (this._playerReady && this.localPlayer) {
-                this.network.joinRoom(this.currentRoom, this.localPlayer.x, this.localPlayer.y);
+                this.network.joinRoom(this._netRoomId(this.currentRoom), this.localPlayer.x, this.localPlayer.y);
             }
         });
 
@@ -293,30 +338,6 @@ export default class RoomScene extends Phaser.Scene {
             this.createPlayerModal.open();
         });
 
-        // Sem sessão válida — tela de login/cadastro/recuperação
-        this.events.on('need-auth', () => {
-            // o modal e DOM (fica por cima do canvas): mantem a tela do logo
-            // atras dele ate a sala rasterizar — hide() aqui expunha o canvas
-            // preto (as layers nascem invisiveis); reveal() esconde o loader
-            if (this._movieReady) this.loadingScreen?.hide();
-            this.authModal.open('login');
-        });
-
-        // Código de recuperação gerado (registro / set / recover) — 1x só
-        this.events.on('account-info', (d) => {
-            this.recoveryCodeModal.open(d);
-        });
-        this.events.on('recovery-ok', (d) => {
-            // Após recuperar, o jogador precisa entrar com a nova senha
-            this.recoveryCodeModal.open(d, () => this.authModal.open('login'));
-        });
-
-        this.events.on('logged-out', () => {
-            localStorage.removeItem('penguin_session');
-            // sessão morreu no servidor — reload limpo para a tela de login
-            setTimeout(() => location.reload(), 400);
-        });
-
         // Virada de festa: o servidor avisa quando a festa ativa muda —
         // recarrega o pacote da sala atual e a música com as novas
         // substituições (pacotes alternativos vivem em movies-party/).
@@ -324,13 +345,6 @@ export default class RoomScene extends Phaser.Scene {
             if (!this.currentRoom || !this._playerReady) return;
             this._initMovie(this.currentRoom);
             this._playMusic(this.currentRoom);
-        });
-
-        // Lista de mundos (multi-mundo) — alimenta o seletor do AuthModal
-        this.events.on('server-list', (d) => {
-            this._worlds = d?.worlds || [];
-            this._worldCurrent = d?.current || null;
-            this.authModal?.setWorlds?.(this._worlds, this._worldCurrent);
         });
 
         // Dados do jogador recebidos - criar pinguim local ou atualizar
@@ -347,9 +361,7 @@ export default class RoomScene extends Phaser.Scene {
             }
             
             if (this._playerReady) {
-                // PLAYER_DATA de refresh (buy/equip/etc.) — fecha modais de auth
-                this.authModal?.onServerResponse?.(true);
-                this.setPasswordModal?.onServerResponse?.(true);
+                // PLAYER_DATA de refresh (buy/equip/etc.)
                 return;
             }
             this._playerReady = true;
@@ -358,29 +370,12 @@ export default class RoomScene extends Phaser.Scene {
             // antes disso o hide() revelava a town parcialmente rasterizada
             if (this._movieReady) this.loadingScreen?.hide();
             this.createPlayerModal?.onServerResponse?.(true);
-            this.authModal?.onServerResponse?.(true);
-            this.setPasswordModal?.onServerResponse?.(true);
-            // Conta legada sem senha (token antigo ou CLAIM_ACCOUNT):
-            // oferece definir senha. Guests novos entram direto.
-            if (data.passwordSetupOffered && !this._pwPromptShown) {
-                this._pwPromptShown = true;
-                setTimeout(() => this.setPasswordModal?.open(), 600);
-            }
             this._initLocalPlayer(data);
         });
 
         // Erros de rede
         this.events.on('net-error', (data) => {
             console.warn('[RoomScene] Net error:', data);
-            // Modal de auth/conta aberto: o erro é dele, não do jogo
-            if (this.authModal?.isOpen) {
-                this.authModal.onServerResponse(false, data.message || data.code);
-                return;
-            }
-            if (this.setPasswordModal?.isOpen) {
-                this.setPasswordModal.onServerResponse(false, data.message || data.code);
-                return;
-            }
             if (data.code === 'NEED_CREATE') {
                 this.loadingScreen?.hide();
                 this.createPlayerModal.open();
@@ -388,10 +383,9 @@ export default class RoomScene extends Phaser.Scene {
                 this.createPlayerModal?.onServerResponse?.(false, data.message);
             } else if (data.code === 'RENAME_FAILED') {
                 this.nameChangeModal?.onServerResponse?.(false, data.message);
-            } else if (data.code === 'WORLD_FULL') {
-                // Mundo lotado: abre a tela de login com o seletor de mundos
-                this.authModal?.open?.('login');
-                this.authModal?.setError?.(data.message || 'Mundo lotado');
+            } else if (data.code === 'CARE_COOLDOWN') {
+                // cooldown de cuidado do pet: o PuffleCard mostra o aviso
+                // na propria interface — nao poluir o chat do pinguim
             } else {
                 // Erro genérico - mostra no chat ou alert
                 this.localPlayer?.showChat?.(`Erro: ${data.message || 'Erro de conexão'}`);
@@ -428,38 +422,11 @@ export default class RoomScene extends Phaser.Scene {
 
         window.__penguin = this.localPlayer; // debug
         this._updateCoinsDisplay();
-        this._maybeShowAdminButton();
-        this._maybeShowSystemsButton();
 
         // Se já estava autenticado, entra na sala
         if (this.network.isConnected) {
-            this.network.joinRoom(this.currentRoom, startX, startY);
+            this.network.joinRoom(this._netRoomId(this.currentRoom), startX, startY);
         }
-    }
-
-    // Moderador/admin: botão flutuante que abre o painel web (/admin)
-    _maybeShowAdminButton() {
-        if (!this.network?.isModerator || this._adminBtn) return;
-        const url = this.network.adminPanelUrl?.();
-        if (!url) return;
-        if (typeof document === 'undefined') return;
-        const b = document.createElement('button');
-        b.textContent = '🛠 Admin';
-        b.style.cssText = 'position:fixed;top:8px;right:8px;z-index:90001;padding:6px 12px;font:700 12px Arial,sans-serif;background:#2c3d50;color:#dfe9f3;border:1px solid #4a6fa5;border-radius:8px;cursor:pointer;';
-        b.onclick = () => window.open(url, '_blank');
-        document.body.appendChild(b);
-        this._adminBtn = b;
-    }
-
-    // Botão "Sistemas" para todos — abre o GamePanel (amigos, correio, etc.)
-    _maybeShowSystemsButton() {
-        if (this._systemsBtn || typeof document === 'undefined') return;
-        const b = document.createElement('button');
-        b.textContent = '☰ Sistemas';
-        b.style.cssText = 'position:fixed;bottom:8px;right:8px;z-index:90001;padding:6px 12px;font:700 12px Arial,sans-serif;background:#2c6e49;color:#fff;border:1px solid #4a8a6a;border-radius:8px;cursor:pointer;';
-        b.onclick = () => this.gamePanel?.open?.('friends');
-        document.body.appendChild(b);
-        this._systemsBtn = b;
     }
 
     // Atualiza display de coins (HUD)
@@ -474,9 +441,15 @@ export default class RoomScene extends Phaser.Scene {
             if (!data || !data.players) return;
             this.clearRemotePlayers();
             data.players.forEach(p => {
-                if (p.playerId !== this.network.playerId) {
-                    this.upsertRemotePlayer(p.playerId, p.x, p.y, p.colorItemId, p.paperdoll, p.username, p.action);
+                if (p.playerId === this.network.playerId) {
+                    // pet equipado do proprio jogador (vem no playerList tb)
+                    if (this.localPlayer) {
+                        this.localPlayer.pet = p.pet || null;
+                        this._syncPetView(this.localPlayer);
+                    }
+                    return;
                 }
+                this.upsertRemotePlayer(p.playerId, p.x, p.y, p.colorItemId, p.paperdoll, p.username, p.action, p.pet);
             });
         });
 
@@ -491,10 +464,6 @@ export default class RoomScene extends Phaser.Scene {
 
         this.events.on('player-chat', (data) => {
             if (!data) return;
-            // guarda o último chat alheio para o botão de denúncia
-            if (data.playerId !== this.network.playerId) {
-                this._lastChat = { playerId: data.playerId, username: data.username, message: data.message };
-            }
             if (data.playerId === this.network.playerId) {
                 // eco do proprio chat ja exibido otimisticamente: so
                 // re-renderiza se o servidor alterou o texto (filtro)
@@ -512,7 +481,17 @@ export default class RoomScene extends Phaser.Scene {
 
         this.events.on('player-joined', (data) => {
             if (!data || data.playerId === this.network.playerId) return;
-            this.upsertRemotePlayer(data.playerId, data.x, data.y, data.colorItemId, data.paperdoll, data.username, data.action);
+            this.upsertRemotePlayer(data.playerId, data.x, data.y, data.colorItemId, data.paperdoll, data.username, data.action, data.pet);
+        });
+
+        // pet de outro jogador equipou/desequipou na sala
+        this.events.on('player-pet', (data) => {
+            if (!data) return;
+            const penguin = data.playerId === this.network.playerId
+                ? this.localPlayer : this.remotePlayers.get(data.playerId);
+            if (!penguin) return;
+            penguin.pet = data.pet || null;
+            this._syncPetView(penguin);
         });
 
         this.events.on('player-equip', (data) => {
@@ -552,6 +531,24 @@ export default class RoomScene extends Phaser.Scene {
             }
         });
 
+        // cuidado do pet (play/rest/feed...): o puffle equipado do dono
+        // toca a animacao de reacao (port do 'pcare' do gopenguin)
+        this.events.on('player-pet-care', (data) => {
+            if (!data?.playerId || !data?.action) return;
+            // casa pelo petRowId nas duas colecoes: o equipado segue em
+            // petViews e os demais pets do jogador vagam em iglooPetViews —
+            // sem isso o cuidado de um pet do iglu animava o equipado
+            for (const v of this.petViews?.values() || []) {
+                if (v.pet?.petRowId === data.petRowId) { v.react(data.action); return; }
+            }
+            for (const v of this.iglooPetViews?.values() || []) {
+                if (v.pet?.petRowId === data.petRowId) { v.react(data.action); return; }
+            }
+            // fallback p/ evento sem petRowId: pet equipado do remetente
+            const follower = this.petViews?.get(data.playerId);
+            if (follower) follower.react(data.action);
+        });
+
         this.events.on('player-left', (data) => {
             if (!data) return;
             const penguin = this.remotePlayers.get(data.playerId);
@@ -559,7 +556,166 @@ export default class RoomScene extends Phaser.Scene {
                 penguin.destroy();
                 this.remotePlayers.delete(data.playerId);
             }
+            this._removePetView(data.playerId);
         });
+    }
+
+    // ---------- pets (pufflers seguindo o pinguim) ----------
+
+    // pet equipado do jogador local a partir do estado social
+    _syncLocalPet() {
+        if (!this.localPlayer || !this.network?.social) return;
+        const eq = (this.network.social.pets || []).find((p) => p.equipped);
+        this.localPlayer.pet = eq ? { petRowId: eq.petRowId, species: eq.species, name: eq.name } : null;
+        this._syncPetView(this.localPlayer);
+    }
+
+    // cria/remove o PuffleView conforme penguin.pet
+    _syncPetView(penguin) {
+        if (!penguin?.playerId) return;
+        let existing = this.petViews.get(penguin.playerId);
+        // trocou de pet (equipar outro desequipa o anterior no server):
+        // a view antiga continuava com o sprite da especie antiga —
+        // era o bug do "azul virou rosa" que so corrigia ao sair do iglu
+        if (existing && penguin.pet &&
+            existing.pet?.petRowId !== penguin.pet.petRowId) {
+            existing.destroy();
+            this.petViews.delete(penguin.playerId);
+            existing = null;
+        }
+        if (penguin.pet && !existing) {
+            this.petViews.set(penguin.playerId, new PuffleView(this, penguin.pet, penguin));
+        } else if (!penguin.pet && existing) {
+            existing.destroy();
+            this.petViews.delete(penguin.playerId);
+        }
+    }
+
+    _removePetView(playerId) {
+        const v = this.petViews.get(playerId);
+        if (v) { v.destroy(); this.petViews.delete(playerId); }
+    }
+
+    // ---------- adocao de puffle (catalogo do Pet Shop) ----------
+
+    // fluxo original do gp: confirm "Would you like to adopt this puffle
+    // for N coins?" -> prompt_mc c/ input "Name your puffle:" -> adocao
+    // -> "X is waiting in your igloo."
+    adoptPuffleFlow(speciesId) {
+        const sp = (this.network?.social?.petSpecies || [])
+            .find((s) => s.id === speciesId);
+        if (!sp) { this.localPlayer?.showChat?.('(unknown pet)'); return; }
+        const coins = this.network?.coins ?? 0;
+        if (coins < sp.cost) {
+            this.promptUI?.show({
+                text: `You need more coins. A ${sp.name} costs ${sp.cost} coins.`,
+                mode: 'ok',
+            });
+            return;
+        }
+        this.promptUI?.show({
+            text: `Would you like to adopt this ${sp.name} for ${sp.cost} coins?`,
+            mode: 'yesno',
+            onYes: () => this.petNameModal?.open(speciesId, (name) => {
+                this.promptUI?.show({
+                    text: `${name} is waiting in your igloo.`,
+                    mode: 'ok',
+                });
+            }),
+        });
+    }
+
+    // pet do iglu sob o ponto (clique abre o puffle card) — so os pets
+    // que vagam em iglooPetViews; o puffle equipado (petViews) segue o
+    // pinguim e NAO abre card (o player card do dono mostra o pet na doll)
+    _iglooPetAt(wx, wy) {
+        for (const v of this.iglooPetViews?.values() || []) {
+            if (v?._ready && Math.abs(wx - v.x) < 22 && Math.abs(wy - (v.y - 10)) < 26) return v;
+        }
+        return null;
+    }
+
+    // puffle equipado sob o ponto -> devolve o pinguim dono (player card)
+    _petFollowerAt(wx, wy) {
+        for (const v of this.petViews?.values() || []) {
+            if (v?._ready && v.owner
+                && Math.abs(wx - v.x) < 22 && Math.abs(wy - (v.y - 10)) < 26) return v.owner;
+        }
+        return null;
+    }
+
+    // ---------- iglu proprio (Fase 3) ----------
+
+    // roomId de rede do iglu e privado por jogador: o pack igloos/N.swf e
+    // generico, mas cada jogador so ve o proprio iglu (visitacao de amigos
+    // fica para depois — o id igloo-<playerId> passa no regex do server)
+    _netRoomId(roomKey) {
+        return roomKey === 'igloo' && this.network?.playerId
+            ? `igloo-${this.network.playerId}`
+            : roomKey;
+    }
+
+    _enterIgloo() {
+        if (this.currentRoom === 'igloo') return;
+        if (!this._playerReady || !this.localPlayer) return;
+        this._iglooReturn = this.currentRoom;
+        // spawn do AS do igloo (start_x/start_y); a safe spawn ajusta
+        this.changeRoom('igloo', 380, 320);
+    }
+
+    _leaveIgloo() {
+        const back = this._iglooReturn && MOVIE_ROOM_MAP[this._iglooReturn]
+            ? this._iglooReturn : 'town';
+        this._iglooReturn = null;
+        this.changeRoom(back);
+    }
+
+    // pets do jogador dentro do iglu: os NAO equipados vagam pelo
+    // pet_area; o equipado segue o pinguim normalmente (petViews)
+    _syncIglooPets() {
+        if (this.currentRoom !== 'igloo' || !this.movie) {
+            for (const v of this.iglooPetViews?.values() || []) v.destroy();
+            this.iglooPetViews?.clear();
+            return;
+        }
+        const wanted = new Map();
+        for (const pet of this.network?.social?.pets || []) {
+            if (!pet.equipped) wanted.set(pet.petRowId, pet);
+        }
+        for (const [id, v] of this.iglooPetViews) {
+            if (!wanted.has(id)) { v.destroy(); this.iglooPetViews.delete(id); }
+        }
+        for (const [id, pet] of wanted) {
+            if (!this.iglooPetViews.has(id)) {
+                this.iglooPetViews.set(id, new PuffleView(this, pet, null, { igloo: true }));
+            }
+        }
+    }
+
+    // fundo do iglu: no original o iglu e desenhado SOBRE a "location"
+    // (igloo/locations/sprites/N.swf — Default Location = 1). Ela substitui
+    // o fundo da sala inteira, entao renderizamos como layer abaixo de
+    // tudo (depth 0 < background_mc ~3 < atores >= 901).
+    async _setupIglooLocation() {
+        const ss = this._ss;
+        const movie = await MovieRoom.load('/assets/movies/igloo-loc1')
+            .then((m) => { m.setScale(1); return m; })
+            .catch((e) => { console.warn('[igloo] location load', e); return null; });
+        if (!movie || this.currentRoom !== 'igloo') return;
+        const clip = new Clip(movie);
+        const frame = movie._mainTl?.frames?.[0] || [];
+        const cv = document.createElement('canvas');
+        cv.width = Math.round(WORLD_W * ss); cv.height = Math.round(WORLD_H * ss);
+        const ctx = cv.getContext('2d');
+        ctx.scale(ss, ss);
+        const ID = { a: 1, b: 0, c: 0, d: 1, x: 0, y: 0 };
+        const COL = { mult: [1, 1, 1, 1], add: [0, 0, 0, 0] };
+        await clip._drawListFrame(ctx, frame, ID, '', COL, ss * 2);
+        const key = 'igloo_location_tex';
+        if (this.textures.exists(key)) this.textures.remove(key);
+        this.textures.addCanvas(key, cv);
+        this._locationImg = this.add.image(WORLD_W / 2, WORLD_H / 2, key)
+            .setDisplaySize(WORLD_W, WORLD_H).setDepth(0);
     }
 
     clearRemotePlayers() {
@@ -567,6 +723,22 @@ export default class RoomScene extends Phaser.Scene {
             penguin.destroy();
         }
         this.remotePlayers.clear();
+        for (const v of this.petViews?.values() || []) v.destroy();
+        this.petViews?.clear();
+        for (const v of this.iglooPetViews?.values() || []) v.destroy();
+        this.iglooPetViews?.clear();
+        this.localPlayer && (this.localPlayer.pet = null);
+    }
+
+    // tick dos pets: seguem o dono (local + remotos) e vagam no iglu
+    update(time, delta) {
+        const dt = Math.min(0.1, (delta || 16.7) / 1000);
+        if (this.petViews?.size) {
+            for (const v of this.petViews.values()) v.tick(dt);
+        }
+        if (this.iglooPetViews?.size) {
+            for (const v of this.iglooPetViews.values()) v.tick(dt);
+        }
     }
 
     // Retorna o pinguim (local ou remoto) sob o ponto, ou null.
@@ -576,7 +748,7 @@ export default class RoomScene extends Phaser.Scene {
             .filter((p) => p && p.view && p._lib);
         let best = null, bestD = Infinity;
         for (const p of candidates) {
-            const b = p._lib.bounds;
+            const b = p._lib.hitBounds || p._lib.bounds;
             const hw = (b.x1 - b.x0) * 0.45, hh = (b.y1 - b.y0) * 0.55;
             const cx = p.x + (b.x0 + b.x1) / 2, cy = p.y + (b.y0 + b.y1) / 2;
             const dx = (wx - cx) / hw, dy = (wy - cy) / hh;
@@ -586,13 +758,15 @@ export default class RoomScene extends Phaser.Scene {
         return best;
     }
 
-    upsertRemotePlayer(playerId, x = 380, y = 300, colorItemId = null, paperdoll = null, username = null, action = null) {
+    upsertRemotePlayer(playerId, x = 380, y = 300, colorItemId = null, paperdoll = null, username = null, action = null, pet = null) {
         let penguin = this.remotePlayers.get(playerId);
         if (!penguin) {
             const colorId = colorItemId || DEFAULT_COLOR_ITEM_ID;
             penguin = new Penguin(this, x, y, playerId, username || playerId, colorId);
             this.remotePlayers.set(playerId, penguin);
         }
+        penguin.pet = pet || penguin.pet || null;
+        this._syncPetView(penguin);
         if (paperdoll) penguin.applyOutfit(paperdoll);
         if (colorItemId) penguin.setColorItemId(colorItemId);
         // estado de acao atual (ex.: dançando ao entrar na sala)
@@ -666,34 +840,11 @@ export default class RoomScene extends Phaser.Scene {
         document.body.appendChild(chatInput);
         this.chatInputRef = chatInput;
 
-        // Botao de denuncia ao lado do pill de chat — reporta a ultima
-        // mensagem recebida de outro jogador
-        const reportBtn = document.createElement('button');
-        reportBtn.textContent = '⚑';
-        reportBtn.title = 'Denunciar última mensagem';
-        Object.assign(reportBtn.style, {
-            position: 'fixed', zIndex: '9998',
-            width: '26px', height: '26px', padding: '0',
-            fontSize: '13px', lineHeight: '26px', textAlign: 'center',
-            color: '#fff', background: 'rgba(20,30,50,.85)',
-            border: '1px solid rgba(255,255,255,.35)', borderRadius: '50%',
-            cursor: 'pointer', display: 'none',
-        });
-        reportBtn.addEventListener('click', () => {
-            const last = this._lastChat;
-            if (!last) { this.localPlayer?.showChat?.('Nada para denunciar ainda.'); return; }
-            this.network.sendReport(last.playerId, last.message, 'chat');
-            this.localPlayer?.showChat?.('Denúncia enviada.');
-        });
-        document.body.appendChild(reportBtn);
-        this.chatReportBtnRef = reportBtn;
-
         this._layoutChatInput();
         this.scale.on('resize', () => this._layoutChatInput());
         // o rect real do chat_mc so existe depois do build async do VectorHud
         this.events.on('vectorhud:ready', () => { mark('hud-ready'); this._layoutChatInput(); });
         this.events.once('shutdown', () => chatInput.remove());
-        this.events.once('shutdown', () => this.chatReportBtnRef?.remove());
         this.events.once('shutdown', () => musicPlayer.stop());
         this.events.once('shutdown', () => this._minigame?.close());
     }
@@ -719,13 +870,6 @@ export default class RoomScene extends Phaser.Scene {
                 width: (r.w * sx - 12) + 'px',
                 height: (r.h * sy - 6) + 'px',
             });
-            if (this.chatReportBtnRef) {
-                Object.assign(this.chatReportBtnRef.style, {
-                    display: 'block',
-                    left: (rect.left + (r.x + r.w) * sx + 4) + 'px',
-                    top: (rect.top + (r.y + r.h / 2) * sy - 13) + 'px',
-                });
-            }
         });
     }
 
@@ -745,7 +889,14 @@ export default class RoomScene extends Phaser.Scene {
                 this.toggleMap();
                 break;
             case 'igloo':
-                this.toggleClothes();
+                this._enterIgloo();
+                break;
+            case 'buddy':
+                this.buddyWindow?.toggle();
+                break;
+            case 'mail':
+            case 'news':
+                this.localPlayer && this.localPlayer.showChat('Em breve!');
                 break;
             case 'help':
                 this.localPlayer && this.localPlayer.showChat('Precisa de ajuda? Visite a seccao Help!');
@@ -938,6 +1089,9 @@ export default class RoomScene extends Phaser.Scene {
         if (this._booting) this.loadingScreen?.showBoot();
         else this.loadingScreen?.show(`Joining ${ROOM_NAMES[roomKey] || roomKey}...`, 0);
         mark(`room-load:${roomKey}`);
+        // iglu: a location e o fundo da sala — carrega o pack dela em
+        // paralelo ao pack do iglu para o loader cobrir os dois
+        if (roomKey === 'igloo') MovieRoom.load('/assets/movies/igloo-loc1').catch(() => {});
         // Otimista: se esta sala ja esta sendo pre-renderizada em segundo
         // plano (vizinha da anterior / jogador clicou na porta), promove o
         // job para urgente e espera ele gravar o cache — terminar o que ja
@@ -1018,21 +1172,32 @@ export default class RoomScene extends Phaser.Scene {
                     mark(`room-ready:${roomKey}${cacheHit ? ':cache' : ''}`);
                     this._movieReady = true;
                     this._booting = false;
-                    this.loadingScreen?.hide();
-                    // sala pronta: libera o warm-up dos SVGs do pinguim/roupas
-                    // (ficou na fila durante o load para nao competir)
-                    PenguinLibrary.startWarm?.();
-                    // cache hit: decodifica os SVGs da sala aos poucos, em
-                    // idle — prontos quando os overlays animarem
-                    if (cacheHit) movie.prefetchSvgs(4);
-                    // otimista: salas vizinhas ja rasterizadas no cache e
-                    // minigames da sala ja baixados antes do clique
-                    this._prerenderAdjacent();
-                    this._prefetchMinigames(movie);
-                    // prefetch idle dos packs das salas nao visitadas (IDB)
-                    this._prefetchRoomsIdle();
-                    // garante que o pinguim está em posição acessível
-                    this._applySafeSpawn();
+                    const finish = () => {
+                        this.loadingScreen?.hide();
+                        // sala pronta: libera o warm-up dos SVGs do pinguim/roupas
+                        // (ficou na fila durante o load para nao competir)
+                        PenguinLibrary.startWarm?.();
+                        // cache hit: decodifica os SVGs da sala aos poucos, em
+                        // idle — prontos quando os overlays animarem
+                        if (cacheHit) movie.prefetchSvgs(4);
+                        // otimista: salas vizinhas ja rasterizadas no cache e
+                        // minigames da sala ja baixados antes do clique
+                        this._prerenderAdjacent();
+                        this._prefetchMinigames(movie);
+                        // prefetch idle dos packs das salas nao visitadas (IDB)
+                        this._prefetchRoomsIdle();
+                        // garante que o pinguim está em posição acessível
+                        this._applySafeSpawn();
+                        // iglu: puffles vagando (a location ja foi aguardada)
+                        if (roomKey === 'igloo') this._syncIglooPets();
+                    };
+                    // iglu: segura o loader ate a location (fundo) estar
+                    // desenhada — sem isso aparecia fundo preto por segundos
+                    if (roomKey === 'igloo') {
+                        this._setupIglooLocation()
+                            .catch((e) => console.warn('[igloo] location', e))
+                            .finally(finish);
+                    } else finish();
                 };
                 // Rasteriza as layers em LANES paralelas: o grosso do tempo
                 // de _renderSegment e espera de decode/raster (artCanvas /
@@ -1197,6 +1362,9 @@ export default class RoomScene extends Phaser.Scene {
     // INTERFACE.showContent("X") do AS das salas: catalogos abrem o viewer,
     // demais conteudos (binoculars etc.) ainda nao implementados.
     openContent(name) {
+        // triggers_mc.map_mc do igloo -> showContent("map"): abre o mapa
+        // da ilha (saida alternativa do iglu; o mapa de iglus e fase futura)
+        if (name === 'map') { this.toggleMap(); return; }
         if (name.endsWith('_catalogue')) {
             this.catalogue?.open(name);
         } else {
@@ -1212,6 +1380,17 @@ export default class RoomScene extends Phaser.Scene {
         if (!this.tableGames) this.tableGames = new TableGames(this);
         if (this.tableGames.isOpen) return;
         this.tableGames.open({ game: table.game, room: this.currentRoom, tableId: table.id });
+    }
+
+    // Ao sair da mesa (desistir/fechar), o pinguim anda para o ponto livre
+    // mais proximo — ficar parado dentro do trigger impede outros de jogar.
+    _leaveTableArea(req) {
+        const lp = this.localPlayer;
+        if (!lp || !this.movie || this.currentRoom !== req?.room) return;
+        const p = this.movie.findFreePoint(lp.x, lp.y);
+        if (!p) return;
+        lp.moveTo(p.x, p.y, 150, () => lp.facePoint?.(p.x, p.y));
+        this.network.sendMove(p.x, p.y);
     }
 
     // Partida pelo painel (lobby ou contra o computador), sem mesa fisica
@@ -1375,13 +1554,18 @@ export default class RoomScene extends Phaser.Scene {
         }
         this._segments = null;
         this.movie = null;
+        this._interactions?.destroy?.();
         this._interactions = null;
+        this._locationImg?.destroy();
+        this._locationImg = null;
         this.cameras.main.setBackgroundColor(0x000000);
     }
 
     changeRoom(newRoomKey, spawnX = null, spawnY = null) {
         if (this.currentRoom === newRoomKey) return;
         if (!this._playerReady || !this.localPlayer) return;
+        // saida do iglu por outra via (mapa da ilha etc.) limpa o retorno
+        if (newRoomKey !== 'igloo') this._iglooReturn = null;
         this.playerCard?.close();
         this._closeMinigame();
         // mesa fisica fica na sala antiga (o servidor tambem levanta o jogador)
@@ -1399,7 +1583,7 @@ export default class RoomScene extends Phaser.Scene {
         this.localPlayer.updateDepth();
 
         this.clearRemotePlayers();
-        this.network.joinRoom(newRoomKey, startX, startY);
+        this.network.joinRoom(this._netRoomId(newRoomKey), startX, startY);
 
         if (this.mapOpen) {
             this.toggleMap();
@@ -1418,5 +1602,6 @@ export default class RoomScene extends Phaser.Scene {
             this.network?.sendMove?.(safe.x, safe.y);
         }
         this._pendingSpawn = null;
+        this._syncIglooPets();
     }
 }

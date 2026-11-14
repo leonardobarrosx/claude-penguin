@@ -6,8 +6,10 @@ import Phaser from 'phaser';
 import { MovieRoom } from '../movie/movie.js';
 import { Clip } from '../movie/clip.js';
 import { veColor } from '../entities/PenguinArt.js';
+import { SPECIES_SPRITE } from '../entities/PuffleView.js';
 import { WORLD_W, WORLD_H } from '../display.js';
 import NameChangeModal from './NameChangeModal.js';
+import { UiTooltip } from './Tooltip.js';
 
 const CARD_SPRITE_ID = '701';
 const CARD_FRAME_SELF = 2; // frame 3 = aba de inventario aberta (painel branco lateral)
@@ -73,14 +75,30 @@ function assetMovieCached(kind, cache, id) {
 const photoMovie = (id) => assetMovieCached('photos', _photoMovies, id);
 const iconMovie = (id) => assetMovieCached('icons', _iconMovies, id);
 
-// lapis minimalista branco — substitui o glifo "?" (char 665.svg) do botao
-// moderatorButtonEditPlayer. Mesma viewBox/pegada do original (10x13.2,
-// grupo centrado em 5,7.2); so esse botao usa o char 665 no pack interface.
+// puffle equipado no card (variante doll com pet): sprite real
+// /assets/puffle/<cor>, frame 1 = stand frontal
+const _puffleMovies = new Map();
+function puffleMovie(dir) {
+    if (!_puffleMovies.has(dir)) {
+        _puffleMovies.set(dir, MovieRoom.load(`/assets/puffle/${dir}`)
+            .then((m) => { m.setScale(1); return m; })
+            .catch((e) => { console.warn('[playercard] puffle', dir, e); _puffleMovies.delete(dir); return null; }));
+    }
+    return _puffleMovies.get(dir);
+}
+
+// lapis branco diagonal (silhueta estilo icone edit: cap quadrado no
+// quadrante sup-dir, corpo retangular, ponta triangular no inf-esq) —
+// substitui o glifo "?" (char 665.svg) do botao moderatorButtonEditPlayer.
+// Mesma viewBox/pegada do original (10x13.2, grupo centrado em 5,7.2); so
+// esse botao usa o char 665 no pack interface.
 const PENCIL_SVG = `<?xml version="1.0" encoding="UTF-8"?>
 <svg xmlns="http://www.w3.org/2000/svg" height="13.2px" width="10.0px">
   <g transform="matrix(1.0, 0.0, 0.0, 1.0, 5.0, 7.2)">
-    <g transform="rotate(-45)">
-      <path fill="#ffffff" fill-rule="evenodd" d="M-1.2 -7.7 L1.2 -7.7 L1.5 -6.3 L1.5 2.7 L0 6.6 L-1.5 2.7 L-1.5 -6.3 L-1.2 -7.7 Z"/>
+    <g transform="rotate(45)">
+      <path fill="#ffffff" d="M-1.5 -6.4 H1.5 V-4.7 H-1.5 Z"/>
+      <path fill="#ffffff" d="M-1.7 -4.7 H1.7 V4.3 H-1.7 Z"/>
+      <path fill="#ffffff" d="M0 6.3 L1.7 4.3 L-1.7 4.3 Z"/>
     </g>
   </g>
 </svg>`;
@@ -151,9 +169,15 @@ export default class PlayerCard {
         this.scene?.wardrobe?.close();
         if (this.dim) { this.dim.destroy(); this.dim = null; }
         if (this.container) { this.container.destroy(true); this.container = null; }
+        this._tooltip?.hide();
+        this._tooltip = null;
         this._cardBounds = null;
         this._drag = null;
         this._placeModBtn = null;
+        this._puffleZone = null;
+        this._puffleRect = null;
+        this._cardSpriteBounds = null;
+        this._cardScale = 1;
         this.scene?.input?.setDefaultCursor('default');
         // textura do card e por-abertura (playercard_<ts>) — sem remover,
         // cada open vazava uma CanvasTexture na GPU
@@ -164,7 +188,26 @@ export default class PlayerCard {
         this._modBtnCleanup?.();
         this._modBtnCleanup = null;
         this._modBtn = null;
+        this._clip = null;
         this.penguin = null;
+    }
+
+    // aplica os frames corretos dos botoes sociais conforme o estado
+    // buddy/ignore — chamado no build e a cada SOCIAL_UPDATE
+    _syncSocialFrames() {
+        const clip = this._clip, p = this.penguin, scene = this.scene;
+        if (!clip || !p || !scene?.network) return;
+        const isSelf = p === scene.localPlayer
+            || (scene.localPlayer && p.playerId === scene.localPlayer.playerId);
+        if (isSelf) return;
+        const isB = !!scene.network.isBuddy?.(p.playerId);
+        const isI = !!scene.network.isIgnored?.(p.playerId);
+        const online = isB && !!scene.remotePlayers?.has?.(p.playerId);
+        clip.set('buddy_mc', { frame: isB ? 3 : isI ? 1 : 2 });
+        clip.set('ignore_mc', { frame: isB ? 1 : isI ? 3 : 2 });
+        clip.set('home_mc', { frame: isB ? 2 : 1 });
+        clip.set('profile_mc', { frame: online ? 2 : 1 });
+        this._repaint?.();
     }
 
     async _build(movie, penguin) {
@@ -185,6 +228,13 @@ export default class PlayerCard {
         // como texto Phaser na posicao nativa do coins_txt (ver abaixo)
         clip.set('coins_txt', { visible: false });
 
+        // estados dos botoes sociais (so no card de outro pinguim) —
+        // port do renderCard do gopenguin: buddy_mc frame 3=ja buddy
+        // (remove), 1=ignored, 2=add normal; ignore_mc 1=buddy, 3=ignored,
+        // 2=normal; home_mc 2=buddy, 1=cinza; profile_mc 2=buddy online
+        this._clip = clip;
+        if (!isSelf) this._syncSocialFrames();
+
         // bounds do frame em coords do sprite -> canvas
         const b = clip._boundsOf(entries, IDENT, '') || [0, 0, 240, 300];
         const w = Math.ceil(b[2] - b[0]), h = Math.ceil(b[3] - b[1]);
@@ -198,7 +248,7 @@ export default class PlayerCard {
         // anchor 110.7,142.9, na ordem feet->body->neck->face->head->hand) ----
         const dollEntry = entries.find((e) => e.name === 'paper_doll_mc');
         const dollFrame = dollEntry && movie.sprites[String(dollEntry.id)]?.frames?.[0];
-        let dollWorld = null, bodyE = null, outlineE = null;
+        let dollWorld = null, bodyE = null, outlineE = null, feetB = null;
         const look = penguin.gpaOutfit || {};
         if (dollFrame) {
             // world = matriz do paper_doll_mc (coords do filho -> frame do
@@ -277,7 +327,9 @@ export default class PlayerCard {
                         const pm = await paperMovie(id);
                         if (!pm) continue;
                         const pclip = new Clip(pm);
-                        await pclip._drawListFrame(ctx, pm.data?.main?.frames?.[0] || [],
+                        const fr = pm.data?.main?.frames?.[0] || [];
+                        if (slot === 'feet') feetB = pclip._boundsOf(fr, dollWorld, '');
+                        await pclip._drawListFrame(ctx, fr,
                             dollWorld, '', IDENT_COLOR, RENDER_SCALE);
                     }
                 }
@@ -292,6 +344,50 @@ export default class PlayerCard {
                         flagWorld, '', IDENT_COLOR, RENDER_SCALE);
                 }
             }
+            // puffle equipado: variante "doll com pet" — sprite real do
+            // puffle em pe a direita do boneco, pes na linha do chao
+            const petDir = SPECIES_SPRITE[penguin.pet?.species];
+            this._puffleRect = null;
+            if (petDir && dollWorld && dollFrame) {
+                const pm = await puffleMovie(petDir);
+                if (pm) {
+                    const pclip = new Clip(pm);
+                    const entries = pm._mainTl?.frames?.[0] || [];
+                    const pb = pclip._boundsOf(entries, IDENT, '');
+                    const dollB = clip._boundsOf(dollFrame, dollWorld, '');
+                    if (pb && dollB) {
+                        const dollH = Math.max(1, dollB[3] - dollB[1]);
+                        // clamp vertical tambem: o chao do doll pode ficar
+                        // rente a borda inferior do card — o puffle subia
+                        // alguns pixels para nao clipar
+                        const ground = Math.min(
+                            Math.max(dollB[3], feetB?.[3] ?? 0), b[3] - dollH * 0.05);
+                        const right = Math.max(dollB[2], feetB?.[2] ?? 0);
+                        const s = (dollH * 0.36) / Math.max(1, pb[3] - pb[1]);
+                        const pW = (pb[2] - pb[0]) * s;
+                        // a esquerda do puffle encosta na direita do doll com
+                        // ~55% de sobreposicao — bem colado no pinguim como
+                        // no original, sem transbordar a borda do card
+                        let left = right + 2 - pW * 0.55;
+                        // clamp: nunca sai dos bounds do card
+                        left = Math.min(left, b[2] - 8 - pW);
+                        left = Math.max(left, b[0] + 8);
+                        // guarda o rect (coords do sprite) p/ a zona de
+                        // clique que desequipa o pet — repositionada a
+                        // cada repaint (_syncPuffleZone)
+                        this._puffleRect = {
+                            x: left, y: ground - (pb[3] - pb[1]) * s,
+                            w: pW, h: (pb[3] - pb[1]) * s,
+                        };
+                        const mat = {
+                            a: s, b: 0, c: 0, d: s,
+                            x: left - pb[0] * s,
+                            y: ground - pb[3] * s,
+                        };
+                        await pclip._drawListFrame(ctx, entries, mat, '', IDENT_COLOR, RENDER_SCALE);
+                    }
+                }
+            }
         };
 
         await paint(false);
@@ -300,6 +396,9 @@ export default class PlayerCard {
         const scale = Math.min(1, 480 / h); // cabe em ~480px de altura
         const dw = w * scale, dh = h * scale;
         this._cardSize = { dw, dh };
+        // guarda p/ _syncPuffleZone (rect do puffle e em coords do sprite)
+        this._cardSpriteBounds = b;
+        this._cardScale = scale;
         // posicao: centro da tela + deslocamento escolhido pelo jogador
         // (arrastando), sempre dentro da area visivel
         const pos = this._clampTopLeft(WORLD_W / 2 + _cardOffset.x - dw / 2, WORLD_H / 2 + _cardOffset.y - dh / 2);
@@ -351,10 +450,18 @@ export default class PlayerCard {
             if (!eb) continue;
             const [bx, by] = px((eb[0] + eb[2]) / 2, (eb[1] + eb[3]) / 2);
             const bw = (eb[2] - eb[0]) * scale, bh = (eb[3] - eb[1]) * scale;
-            const zone = scene.add.zone(bx, by, Math.max(bw, 22 * scale), Math.max(bh, 22 * scale))
+            const zw = Math.max(bw, 22 * scale), zh = Math.max(bh, 22 * scale);
+            const zone = scene.add.zone(bx, by, zw, zh)
                 .setInteractive({ useHandCursor: true });
             zone.name = `pcard_${action}`;
             zone.on('pointerdown', () => this._button(action));
+            // hint amarela original do CP (hint_mc) no hover do rename
+            if (action === 'rename') {
+                this._tooltip = this._tooltip || new UiTooltip(scene, cont);
+                zone.on('pointerover', () =>
+                    this._tooltip.show(bx - zw / 2, by - zh / 2, zw, zh, 'Rename penguin'));
+                zone.on('pointerout', () => this._tooltip.hide());
+            }
             cont.add(zone);
         }
 
@@ -365,6 +472,19 @@ export default class PlayerCard {
                 .setInteractive({ useHandCursor: true });
             dz.on('pointerdown', () => { scene.wardrobe?.open(scene.localPlayer); });
             cont.add(dz);
+        }
+
+        // self: clicar no puffle da doll desequipa o pet (PET_EQUIP faz
+        // toggle — ele volta a vagar no iglu). So no card proprio: o
+        // server so deixa equipar/guardar pets do proprio jogador.
+        if (isSelf && penguin.pet?.petRowId) {
+            this._puffleZone = scene.add.zone(0, 0, 10, 10)
+                .setInteractive({ useHandCursor: true });
+            this._puffleZone.on('pointerdown', () => {
+                scene.network?.petEquip(penguin.pet.petRowId);
+            });
+            cont.add(this._puffleZone);
+            this._syncPuffleZone();
         }
 
         // Coins do jogador local — editText nativo coins_txt (id 667:
@@ -398,45 +518,6 @@ export default class PlayerCard {
             this.close();
         });
 
-        // Botao de moderacao (escudo) — so para mod/admin vendo OUTRO jogador.
-        // DOM sobre o card; abre o ModMenu com as acoes disponiveis.
-        if (!isSelf && scene.network?.isModerator && scene.modMenu) {
-            const mb = document.createElement('button');
-            mb.textContent = 'MOD';
-            mb.title = 'Ações de moderação';
-            Object.assign(mb.style, {
-                position: 'fixed', zIndex: '90003',
-                padding: '5px 10px', fontSize: '11px', fontWeight: '700',
-                color: '#fff', background: '#7a2e2e',
-                border: '1px solid #a54a4a', borderRadius: '7px',
-                cursor: 'pointer', fontFamily: 'Arial, sans-serif',
-            });
-            const place = this._placeModBtn = () => {
-                const rect = scene.game.canvas.getBoundingClientRect();
-                const sx = rect.width / WORLD_W, sy = rect.height / WORLD_H;
-                const wx = this._cardBounds ? this._cardBounds.right - 30 : WORLD_W / 2;
-                const wy = this._cardBounds ? this._cardBounds.top + 16 : 40;
-                mb.style.left = (rect.left + wx * sx) + 'px';
-                mb.style.top = (rect.top + wy * sy) + 'px';
-            };
-            place();
-            mb.onclick = (e) => {
-                e.stopPropagation();
-                place();
-                const rect = scene.game.canvas.getBoundingClientRect();
-                const sx = rect.width / WORLD_W, sy = rect.height / WORLD_H;
-                const wx = this._cardBounds ? this._cardBounds.right + 10 : WORLD_W / 2;
-                const wy = this._cardBounds ? this._cardBounds.top : 40;
-                scene.modMenu.open(
-                    { playerId: penguin.playerId, username: penguin.username },
-                    rect.left + wx * sx, rect.top + wy * sy
-                );
-            };
-            document.body.appendChild(mb);
-            this._modBtn = mb;
-            this._modBtnCleanup = () => mb.remove();
-        }
-
         // guarda a funcao de repaint para _refresh() (wardrobe equipa itens)
         this._repaint = async () => {
             if (this.container !== cont) return;
@@ -444,6 +525,7 @@ export default class PlayerCard {
                 this._coinsText.setText(`Your Coins: ${scene.network?.coins || 0}`);
             }
             await paint(true);
+            this._syncPuffleZone();
             if (this.container === cont && scene.textures.exists(texKey)) {
                 scene.textures.get(texKey).refresh();
             }
@@ -519,6 +601,26 @@ export default class PlayerCard {
         });
     }
 
+    // reposiciona a zona de clique do puffle sobre o rect pintado no
+    // canvas (o rect pode mudar no repaint quando os papers carregam e
+    // o ground/feetB se ajustam)
+    _syncPuffleZone() {
+        const z = this._puffleZone, r = this._puffleRect;
+        if (!z) return;
+        const b = this._cardSpriteBounds, s = this._cardScale || 1;
+        if (!r || !b) {
+            z.setVisible(false);
+            // zona invisivel continua hittable no Phaser — desativa o
+            // input p/ nao capturar cliques numa area vazia do card
+            if (z.input) z.input.enabled = false;
+            return;
+        }
+        z.setVisible(true);
+        if (z.input) z.input.enabled = true;
+        z.setPosition((r.x + r.w / 2 - b[0]) * s, (r.y + r.h / 2 - b[1]) * s);
+        z.setSize(r.w * s, r.h * s);
+    }
+
     // repinta o doll quando o wardrobe equipa/desequipa itens
     _refresh() {
         if (!this.container || !this.penguin) return;
@@ -548,35 +650,46 @@ export default class PlayerCard {
                     this.nameChangeModal.open();
                 }
                 break;
-            case 'ignore':
-                // lista de ignorados (sistemas de jogo)
-                if (this.penguin?.playerId && this.penguin !== scene.localPlayer) {
-                    scene.network?.send('IGNORE_ADD', { playerId: this.penguin.playerId });
-                    scene.localPlayer?.showChat?.(`Você agora ignora ${this.penguin.username}.`);
+            case 'buddy': {
+                // add buddy por username (servidor resolve p/ playerId)
+                const net = scene.network;
+                const target = this.penguin;
+                if (!net || !target || target === scene.localPlayer) break;
+                // ignored (sem ser buddy): botao cinza sem acao — igual ao gp
+                if (net.isIgnored?.(target.playerId) && !net.isBuddy?.(target.playerId)) break;
+                if (net.isBuddy?.(target.playerId)) {
+                    scene.localPlayer?.showChat?.(`(${target.username} is already your buddy)`);
+                } else {
+                    // confirmacao visual vem do server via BUDDY_REQUEST_SENT
+                    // -> prompt_mc "Request Sent" (RoomScene)
+                    net.buddyAdd(target.username);
                 }
                 break;
+            }
+            case 'ignore': {
+                // toggle ignore — chat do jogador some para mim
+                const net = scene.network;
+                const target = this.penguin;
+                if (!net || !target || target === scene.localPlayer) break;
+                // buddy: botao cinza sem acao — igual ao gp (ignore_mc frame 1)
+                if (net.isBuddy?.(target.playerId)) break;
+                if (net.isIgnored?.(target.playerId)) {
+                    net.ignoreRemove(target.playerId);
+                    scene.localPlayer?.showChat?.(`(no longer ignoring ${target.username})`);
+                } else {
+                    net.ignoreAdd(target.playerId);
+                    scene.localPlayer?.showChat?.(`(ignoring ${target.username} — their chat is hidden)`);
+                }
+                break;
+            }
             case 'report':
-                // denúncia vai para a fila de reports do servidor
-                if (this.penguin?.playerId && this.penguin !== scene.localPlayer) {
-                    scene.network?.sendReport?.(this.penguin.playerId, null, 'player card');
-                    scene.localPlayer?.showChat?.('Denúncia enviada.');
-                }
-                break;
-            case 'buddy':
-                // amizade mútua (sistemas de jogo)
-                if (this.penguin?.playerId && this.penguin !== scene.localPlayer) {
-                    scene.network?.send('FRIEND_ADD', { playerId: this.penguin.playerId });
-                    scene.localPlayer?.showChat?.(`${this.penguin.username} adicionado aos amigos.`);
-                }
-                break;
             case 'home':
-                scene.gamePanel?.open?.('igloo');
-                break;
             case 'mail':
-                scene.gamePanel?.open?.('mail', { mailTo: this.penguin?.username });
-                break;
             case 'stamps':
-                scene.gamePanel?.open?.('stamps');
+                // acoes ainda sem backend — so feedback
+                if (this.penguin) {
+                    scene.localPlayer?.showChat?.(`(${action} on ${this.penguin.username} — coming soon)`);
+                }
                 break;
         }
     }

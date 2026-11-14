@@ -6,8 +6,6 @@
 import db from './db.js';
 import catalog from './catalog.js';
 import crypto from 'crypto';
-import * as accounts from './accounts.js';
-const { isValidUsername, normalizeUsername, usernameKey, legacyGraceActive } = accounts;
 
 const PAPERDOLL_SLOTS = ['feet', 'body', 'neck', 'hand', 'face', 'head'];
 // flag = pin/bandeira do player card (item type 8), photo = fundo do card (type 9)
@@ -30,6 +28,12 @@ function generateSessionToken() {
 
 function todayString() {
     return new Date().toISOString().split('T')[0];
+}
+
+function isValidUsername(username) {
+    if (!username || typeof username !== 'string') return false;
+    const trimmed = username.trim();
+    return trimmed.length >= 3 && trimmed.length <= 16 && !/\s{2,}/.test(trimmed);
 }
 
 // ---------- Player CRUD ----------
@@ -59,21 +63,13 @@ export function getPlayerByUsername(username) {
     return row ? hydratePlayer(row) : null;
 }
 
-// Busca case-insensitive via username_key (unicidade de cadastro/login)
-export function getPlayerByUsernameKey(key) {
-    const stmt = db.prepare('SELECT * FROM players WHERE username_key = ?');
-    const row = stmt.get(String(key || '').toLowerCase());
-    return row ? hydratePlayer(row) : null;
-}
-
 export function createPlayer(ip, username, colorItemId = 1) {
     if (!isValidUsername(username)) {
         throw new Error('Nome de usuário inválido (3-16 caracteres, sem espaços duplos)');
     }
 
-    // Verifica unicidade do nome (case-insensitive)
-    const cleanName = normalizeUsername(username);
-    const existing = getPlayerByUsernameKey(usernameKey(cleanName));
+    // Verifica unicidade do nome
+    const existing = getPlayerByUsername(username);
     if (existing) {
         throw new Error('Nome de usuário já está em uso');
     }
@@ -83,11 +79,11 @@ export function createPlayer(ip, username, colorItemId = 1) {
     const now = Date.now();
 
     const stmt = db.prepare(`
-        INSERT INTO players (player_id, ip, session_token, username, username_key, color_item_id, coins, created_at, last_seen)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO players (player_id, ip, session_token, username, color_item_id, coins, created_at, last_seen)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
     `);
 
-    stmt.run(playerId, ip, sessionToken, cleanName, usernameKey(cleanName), colorItemId, STARTING_COINS, now, now);
+    stmt.run(playerId, ip, sessionToken, username.trim(), colorItemId, STARTING_COINS, now, now);
 
     // O jogador já "possui" a cor inicial — sem isso o wardrobe mostraria
     // cadeado/preço na própria cor e o SET_COLOR falharia na validação.
@@ -121,15 +117,14 @@ export function renamePlayer(playerId, newUsername) {
         throw new Error('Você já utilizou sua troca de nome');
     }
 
-    // Verifica unicidade (case-insensitive)
-    const cleanName = normalizeUsername(newUsername);
-    const existing = getPlayerByUsernameKey(usernameKey(cleanName));
+    // Verifica unicidade
+    const existing = getPlayerByUsername(newUsername);
     if (existing && existing.player_id !== playerId) {
         throw new Error('Nome de usuário já está em uso');
     }
 
-    const stmt = db.prepare('UPDATE players SET username = ?, username_key = ?, name_changed_at = ?, last_seen = ? WHERE player_id = ?');
-    stmt.run(cleanName, usernameKey(cleanName), Date.now(), Date.now(), playerId);
+    const stmt = db.prepare('UPDATE players SET username = ?, name_changed_at = ?, last_seen = ? WHERE player_id = ?');
+    stmt.run(newUsername.trim(), Date.now(), Date.now(), playerId);
 
     return getPlayerById(playerId);
 }
@@ -293,72 +288,6 @@ export function equipItem(playerId, slot, itemId) {
     return getEquipped(playerId);
 }
 
-// ---------- Contas (senha / recovery) ----------
-
-export function setPasswordHash(playerId, passwordHash) {
-    db.prepare('UPDATE players SET password_hash = ?, last_seen = ? WHERE player_id = ?')
-        .run(passwordHash, Date.now(), playerId);
-}
-
-export function setRecoveryCode(playerId, recoveryHash, recoveryLabel) {
-    db.prepare('UPDATE players SET recovery_hash = ?, recovery_label = ?, last_seen = ? WHERE player_id = ?')
-        .run(recoveryHash, recoveryLabel, Date.now(), playerId);
-}
-
-export function getPasswordHash(playerId) {
-    const row = db.prepare('SELECT password_hash FROM players WHERE player_id = ?').get(playerId);
-    return row?.password_hash || null;
-}
-
-export function hasPassword(playerId) {
-    return !!getPasswordHash(playerId);
-}
-
-export function getRecoveryHash(playerId) {
-    const row = db.prepare('SELECT recovery_hash FROM players WHERE player_id = ?').get(playerId);
-    return row?.recovery_hash || null;
-}
-
-export function setRole(playerId, role) {
-    db.prepare('UPDATE players SET role = ? WHERE player_id = ?').run(role, playerId);
-}
-
-export function getPlayerSummary(playerId) {
-    return db.prepare(`
-        SELECT player_id, username, username_key, role, coins, color_item_id,
-               created_at, last_seen, muted_until, all_items,
-               (password_hash IS NOT NULL) AS has_password
-        FROM players WHERE player_id = ?
-    `).get(playerId);
-}
-
-export function searchPlayers(query, limit = 20) {
-    const like = `%${String(query || '').replace(/[%_]/g, '')}%`;
-    return db.prepare(`
-        SELECT player_id, username, role, coins, created_at, last_seen
-        FROM players
-        WHERE username LIKE ? OR username_key LIKE ?
-        ORDER BY last_seen DESC LIMIT ?
-    `).all(like, like.toLowerCase(), limit);
-}
-
-export function updatePlayerCoins(playerId, coins) {
-    db.prepare('UPDATE players SET coins = ? WHERE player_id = ?').run(Math.max(0, Math.round(coins)), playerId);
-}
-
-export function grantItem(playerId, itemId, quantity = 1) {
-    addItem(playerId, itemId, quantity);
-}
-
-export function setPlayerUsername(playerId, username) {
-    db.prepare('UPDATE players SET username = ?, username_key = ?, last_seen = ? WHERE player_id = ?')
-        .run(normalizeUsername(username), usernameKey(username), Date.now(), playerId);
-}
-
-export function resetPassword(playerId, passwordHash) {
-    db.prepare('UPDATE players SET password_hash = ? WHERE player_id = ?').run(passwordHash, playerId);
-}
-
 // ---------- Hydration ----------
 
 function hydratePlayer(row) {
@@ -370,9 +299,6 @@ function hydratePlayer(row) {
         color_item_id: row.color_item_id,
         coins: row.coins,
         all_items: !!row.all_items,
-        has_password: !!row.password_hash,
-        role: row.role || 'player',
-        muted_until: row.muted_until || null,
         last_daily_bonus: row.last_daily_bonus,
         name_changed_at: row.name_changed_at,
         created_at: row.created_at,
@@ -396,11 +322,7 @@ export function getPublicPlayerData(playerId) {
         inventory: player.inventory,
         equipped: player.equipped,
         canRename: !player.name_changed_at,
-        allItems: !!player.all_items,
-        hasPassword: !!player.has_password,
-        needsPasswordSetup: !player.has_password,
-        legacyGraceActive: accounts.legacyGraceActive(),
-        role: player.role || 'player'
+        allItems: !!player.all_items
     };
 }
 
@@ -411,19 +333,6 @@ export default {
     getPlayerByUsername,
     createPlayer,
     updatePlayerSession,
-    setPasswordHash,
-    setRecoveryCode,
-    getPasswordHash,
-    hasPassword,
-    getRecoveryHash,
-    setRole,
-    getPlayerSummary,
-    searchPlayers,
-    updatePlayerCoins,
-    grantItem,
-    setPlayerUsername,
-    resetPassword,
-    getPlayerByUsernameKey,
     updatePlayerColor,
     renamePlayer,
     touchPlayer,

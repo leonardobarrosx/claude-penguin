@@ -13,6 +13,17 @@ const STAGE_W = 760, STAGE_H = 480, RATE = 24;
 const PACK = '/assets/movies/games/fish/IceFishing';
 const FRAME_GAME = 38; // _mainFrame (1-based) do estado de gameplay
 
+// Sons extraidos do IceFishing.swf original (Wand vanilla-media) para
+// /assets/sfx/fish/sound_N.mp3 — idx = ordem dos DefineSound no SWF
+// (o tag sound_343 nao tem sync MP3 e foi pulado). O games.json do CP
+// original declara music_id=0 para este minigame: nao havia BGM, so SFX.
+// exports do SWF: 1=snip 2=shark 4=ding 5=chomp 6=fishfleesound
+// 7=fishicebox (SWF3 = faixa de 130s nao referenciada — descartada).
+const SND_IDX = { snip: 0, shark: 1, ding: 3, chomp: 4, fishfleesound: 5, fishicebox: 6 };
+// timelines.json renumera os ids dos sons de timeline (o conversor pulou
+// o SWF3/musica): conv id -> idx do arquivo extraido.
+const TL_SND = { '5': 5, '6': 6, '212': 7, '242': 8, '277': 9, '375': 10, '389': 11, '424': 12, '435': 13 };
+
 const matMul = (p, q) => ({
     a: p.a * q.a + p.c * q.b, b: p.b * q.a + p.d * q.b,
     c: p.a * q.c + p.c * q.d, d: p.b * q.c + p.d * q.d,
@@ -26,12 +37,6 @@ const text = (k) => TEXT.get(k) || '';
 
 function replace(source, a, b) {
     return source.replace(/%0/g, String(a)).replace(/%1/g, String(b));
-}
-
-// Otimista: baixa e parseia o pack do movie antes do clique no jogo
-// (MovieRoom.load deduplica — o init() do jogo reaproveita o resultado).
-export function warmIceFishing() {
-    return MovieRoom.load(PACK).catch(() => null);
 }
 
 export class IceFishingGame {
@@ -57,16 +62,21 @@ export class IceFishingGame {
 
         this.movie = await MovieRoom.load(PACK);
         if (this._destroyed) return;
+        this.movie._sndQueue = []; // habilita emissao de sons de timeline
         this.movie.prefetchSvgs?.();
         // raster fixo em scale=2: sem isso eff=scale*k muda a cada frame
         // (peixes se movem) -> cache de artCanvas nunca acerta -> re-raster
         // continuo = tela piscando + FPS baixo (mesmo fix do catalogo)
         this.movie.artFlatScale = true;
 
-        // 148/149/150.svg = linha da vara + isca: no SWF sao paths com
-        // stroke-width 0.05 (hairline). O Flash aplicava stroke-hinting e
-        // renderizava ~1px; nosso renderer SVG nao — a linha ficava
-        // invisivel. Override local: traco de 1 unidade (~1-2px na tela).
+        // 147.svg = linha da vara: no SWF e um path vertical 0x100 com
+        // stroke-width 0.05 dentro de um SVG width="0.0px" — viewport zero
+        // rasteriza vazio e o traco hairline fica sub-pixel mesmo com o
+        // fallback de size do artCanvas. Override local com viewport real
+        // (2x100) e traco ~1px na tela. 148/149/150 = partes do anzol/isca.
+        this.movie.setSvgOverride('147.svg',
+            '<svg xmlns="http://www.w3.org/2000/svg" width="2px" height="100px" viewBox="0 0 2 100">'
+            + '<path d="M0.5 0 L0.5 100" fill="none" stroke="#666666" stroke-width="0.5" stroke-linecap="round"/></svg>');
         for (const f of ['148.svg', '149.svg', '150.svg']) {
             const svg = this.movie._svgText(f);
             if (svg) this.movie.setSvgOverride(f,
@@ -220,6 +230,7 @@ export class IceFishingGame {
         m.group = 0; m.iceboxBlock = 0; m.currentFish = 0; m.won = false; m.over = false;
 
         this.movie.goto('', FRAME_GAME);
+        this._musicStart();
         this.movie.set('puffle', { visible: false });
         this.movie.set('gameOver_mc', { visible: false });
         this._label('lives_mc.lives', '3');
@@ -244,6 +255,52 @@ export class IceFishingGame {
 
     _label(path, key) { this.movie.set(path, { text: text(key) }); }
     _number(path, n) { this.movie.set(path, { text: String(n) }); }
+
+    // ---------- audio ----------
+
+    _sfx(name) {
+        const idx = SND_IDX[name];
+        if (idx !== undefined) this._playIdx(idx);
+    }
+
+    _playIdx(idx) {
+        if (!this._sndCache) this._sndCache = new Map();
+        let a = this._sndCache.get(idx);
+        if (!a) {
+            a = new Audio(`/assets/sfx/fish/sound_${idx}.mp3`);
+            a.preload = 'auto';
+            this._sndCache.set(idx, a);
+        }
+        try {
+            a.volume = 0.9;
+            a.currentTime = 0;
+            a.play().catch(() => {});
+        } catch { /* autoplay policy */ }
+    }
+
+    // BGM do jogo: faixa longa dos DefineSound do SWF em loop no gameplay.
+    _musicStart() {
+        if (this._music) return;
+        const a = new Audio('/assets/sfx/fish/sound_2.mp3');
+        a.loop = true;
+        a.volume = 0.45;
+        a.play().catch(() => {});
+        this._music = a;
+    }
+
+    _musicStop() {
+        try { this._music?.pause(); } catch {}
+        this._music = null;
+    }
+
+    // Sons de timeline emitidos pelo MovieRoom (frames "entrados" via
+    // tick/goto) — ids do timelines.json mapeados por TL_SND.
+    _drainSounds() {
+        for (const id of this.movie.drainSounds?.() || []) {
+            const idx = TL_SND[String(id)];
+            if (idx !== undefined) this._playIdx(idx);
+        }
+    }
 
     // ---------- port dos helpers do C ----------
 
@@ -397,6 +454,7 @@ export class IceFishingGame {
     _flee(gray) {
         const m = this.model;
         m.consecutive = 0;
+        this._sfx('fishfleesound');
         const hook = this._pos('hook');
         const name = gray ? 'grayfishflee' : 'fishflee';
         this._moveTo(name, hook[4], hook[5]);
@@ -412,6 +470,7 @@ export class IceFishingGame {
                 this._goto(name, 1, false);
                 this._goto('hook', gray ? 7 : 5, false);
                 this.model.hookEmpty = false;
+                this._sfx('chomp');
             }
         }
     }
@@ -433,6 +492,7 @@ export class IceFishingGame {
             if (m.fishCaught >= 63) { /* stamp fly — ignorado */ }
             this._number('icebox.fishNum', m.fishCaught);
             this._label('icebox.fish', m.fishCaught === 1 ? 'ingame_fish' : 'ingame_fishies');
+            this._sfx('fishicebox');
         } else {
             this._goto('hook', 1, false);
             this._flee(gray);
@@ -503,10 +563,11 @@ export class IceFishingGame {
     _sharkHit() {
         const m = this.model;
         if (m.isHit) return;
-        if (this._hit('sharkLeft.hotspot', 'hook.hotspot')) this._lineCut('sharkLeft');
+        if (this._hit('sharkLeft.hotspot', 'hook.hotspot')) { this._lineCut('sharkLeft'); this._sfx('shark'); }
         if (this._hit('sharkRight.hotspot', 'hook.hotspot')) {
             if (!m.hookEmpty) { /* stamp snack */ }
             this._lineCut('sharkRight');
+            this._sfx('shark');
         }
     }
 
@@ -601,6 +662,7 @@ export class IceFishingGame {
             this._label('oneupText.mc.label', 'ingame_1UP');
             this._moveTo('oneupText', 367, 330);
             this._goto('oneupText', 2, true);
+            this._sfx('ding');
         } else if (m.oneupAlpha < 100) m.oneupAlpha -= 10;
         if (m.oneupAlpha < 10) {
             this._goto('oneup', 1, false);
@@ -699,6 +761,7 @@ export class IceFishingGame {
                 this._moveTo(name, 900, this._pos(name)[5]);
             } else if (name === 'crab1' || name === 'crab2') {
                 // n==148 som snip; n==149 crab_hit
+                if (n === 148) this._sfx('snip');
                 if (n === 149) this._crabHit();
             } else if (name === 'puffle' && n === 237) {
                 this._levelUp();
@@ -716,6 +779,7 @@ export class IceFishingGame {
         const m = this.model;
         m.ticks++;
         this.movie.tick();
+        this._drainSounds();
         this._watch();
         if (!this.started || !m.running) return;
         this._chooser();
@@ -743,11 +807,13 @@ export class IceFishingGame {
             this.movie.gotoPath('hook.electro', 1, false);
             this._electroLive = false;
         }
+        this._drainSounds();
     }
 
     _finish() {
         if (this.finished) return;
         this.finished = true;
+        this._musicStop();
         const coins = this.started ? this._coins() : 0;
         this.onCoins(coins);
         this.destroy();
@@ -790,6 +856,7 @@ export class IceFishingGame {
 
     destroy() {
         this._destroyed = true;
+        this._musicStop();
         cancelAnimationFrame(this._raf);
         this.canvas?.removeEventListener('mousemove', this._onMove);
         this.canvas?.removeEventListener('mousedown', this._onDown);

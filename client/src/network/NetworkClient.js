@@ -23,8 +23,10 @@ export default class NetworkClient {
         this.inventory = [];
         this.equipped = {};
         this.canRename = false;
-        this.role = 'player';
-        this.party = null; // festa ativa (Fase 8) — vem no PLAYER_DATA
+
+        // Estado social (fase 1): buddies, pedidos, ignores, pets
+        this.social = { buddies: [], requests: [], ignores: [], pets: [], petSpecies: [] };
+        this.party = null; // festa ativa — vem no PLAYER_DATA
         
         this.url = NetworkClient.resolveUrl();
         // socket aberto (e ja autenticado) por preconnect() antes do Phaser
@@ -38,10 +40,6 @@ export default class NetworkClient {
     static resolveUrl() {
         const envUrl = import.meta.env?.VITE_WS_URL;
         if (envUrl) return envUrl;
-        // Mundo escolhido pelo jogador na tela de login (multi-mundo)
-        let savedWorld = null;
-        try { savedWorld = localStorage.getItem('penguin_world_url'); } catch { /* sem storage */ }
-        if (savedWorld) return savedWorld;
         if (window.location.protocol === 'https:') return `wss://${window.location.host}/ws`;
         return `ws://${window.location.hostname || 'localhost'}:8080`;
     }
@@ -64,7 +62,6 @@ export default class NetworkClient {
         // Sem token e sem pedido de guest: servidor responde NEED_AUTH
         // e o cliente abre a tela de login/cadastro.
         return [
-            ['SERVER_LIST', {}],
             ['AUTH_GUEST', {
                 sessionToken: sessionToken || undefined,
                 forceGuest: forceGuest || undefined,
@@ -196,55 +193,6 @@ export default class NetworkClient {
         this.send('AUTH_GUEST', { guest: true });
     }
 
-    login(username, password) {
-        this.send('LOGIN', { username, password });
-    }
-
-    register(username, password) {
-        this.send('REGISTER', { username, password });
-    }
-
-    recover(username, code, newPassword) {
-        this.send('RECOVER', { username, code, newPassword });
-    }
-
-    claimAccount(username) {
-        this.send('CLAIM_ACCOUNT', { username });
-    }
-
-    setPassword(password) {
-        this.send('SET_PASSWORD', { password });
-    }
-
-    logout() {
-        this.send('LOGOUT', {});
-    }
-
-    sendReport(targetPlayerId = null, targetMessage = null, reason = null) {
-        this.send('REPORT', { targetPlayerId, targetMessage, reason });
-    }
-
-    sendModAction(action, targetPlayerId, { reason = null, minutes = null, newRole = null } = {}) {
-        this.send('MOD_ACTION', { action, targetPlayerId, reason, minutes, newRole });
-    }
-
-    get isModerator() {
-        return this.role === 'moderator' || this.role === 'admin';
-    }
-    get isAdmin() {
-        return this.role === 'admin';
-    }
-
-    // URL do painel admin (mesma origem do servidor: http(s)://host[:port]/admin)
-    adminPanelUrl() {
-        try {
-            const u = new URL(this.url.replace(/^ws/, 'http'));
-            return `${u.protocol}//${u.host}/admin`;
-        } catch {
-            return null;
-        }
-    }
-
     loginPlayer(username) {
         this.send('LOGIN_PLAYER', { username });
     }
@@ -331,6 +279,30 @@ export default class NetworkClient {
         this.send('PLAYER_ACTION', { action: action || null });
     }
 
+    // ---------- Social (fase 1) ----------
+
+    getSocial() {
+        this.send('GET_SOCIAL', {});
+    }
+
+    buddyAdd(username) { this.send('BUDDY_ADD', { username }); }
+    buddyAccept(playerId) { this.send('BUDDY_ACCEPT', { playerId }); }
+    buddyDecline(playerId) { this.send('BUDDY_DECLINE', { playerId }); }
+    buddyCancel(playerId) { this.send('BUDDY_CANCEL', { playerId }); }
+    buddyRemove(playerId) { this.send('BUDDY_REMOVE', { playerId }); }
+    ignoreAdd(playerId) { this.send('IGNORE_ADD', { playerId }); }
+    ignoreRemove(playerId) { this.send('IGNORE_REMOVE', { playerId }); }
+    petAdopt(species, name) { this.send('PET_ADOPT', { species, name }); }
+    petRename(petRowId, name) { this.send('PET_RENAME', { petRowId, name }); }
+    petRelease(petRowId) { this.send('PET_RELEASE', { petRowId }); }
+    petCare(petRowId, action) { this.send('PET_CARE', { petRowId, action }); }
+    petEquip(petRowId) { this.send('PET_EQUIP', { petRowId }); }
+
+    // helpers de estado social
+    isBuddy(playerId) { return this.social.buddies.some((b) => b.playerId === playerId); }
+    isIgnored(playerId) { return this.social.ignores.some((i) => i.playerId === playerId); }
+    buddyRequestFrom(playerId) { return this.social.requests.find((r) => r.playerId === playerId && r.direction === 'received'); }
+
     // ---------- Processamento de pacotes ----------
 
     handlePacket(packet) {
@@ -344,35 +316,38 @@ export default class NetworkClient {
             case 'NEED_CREATE':
                 this.scene.events.emit('need-create-player');
                 break;
-            case 'NEED_AUTH':
-                mark('need-auth');
-                this.scene.events.emit('need-auth');
-                break;
-            case 'ACCOUNT_INFO':
-                this.scene.events.emit('account-info', data);
-                break;
-            case 'RECOVERY_OK':
-                this.scene.events.emit('recovery-ok', data);
-                break;
-            case 'LOGGED_OUT':
-                this.scene.events.emit('logged-out');
-                break;
-            case 'REPORT_OK':
-                this._showDomToast('Denúncia enviada. Obrigado!', '#2fb344');
-                this.scene.events.emit('report-ok', data);
-                break;
-            case 'MOD_OK':
-                this.scene.events.emit('mod-ok', data);
-                break;
-            case 'SERVER_LIST':
-                this.scene.events.emit('server-list', data);
-                break;
             case 'PARTY_UPDATE':
                 this.party = data?.party || null;
                 this.scene.events.emit('party-update', data);
                 break;
             case 'ERROR':
+                // feedback de moderacao: toast generico (nunca expoe a palavra)
+                if (['CHAT_FILTERED', 'CHAT_RATE_LIMITED', 'NAME_FILTERED', 'CARE_COOLDOWN'].includes(data?.code)) {
+                    this._showDomToast(data.message || 'Ação não permitida', '#c0392b');
+                }
                 this.scene.events.emit('net-error', data);
+                break;
+            case 'SOCIAL_UPDATE':
+                this.social = {
+                    buddies: data.buddies || [],
+                    requests: data.requests || [],
+                    ignores: data.ignores || [],
+                    pets: data.pets || [],
+                    petSpecies: data.petSpecies || this.social.petSpecies
+                };
+                this.scene.events.emit('social-update', this.social);
+                break;
+            case 'BUDDY_REQUEST':
+                // notificacao visual fica a cargo da cena (PromptUI prompt_mc)
+                this.scene.events.emit('buddy-request', data);
+                this.getSocial();
+                break;
+            case 'BUDDY_REQUEST_SENT':
+                this.scene.events.emit('buddy-request-sent', data);
+                break;
+            case 'BUDDY_ACCEPTED':
+                this.scene.events.emit('buddy-accepted', data);
+                this.getSocial();
                 break;
             case 'ITEM_BOUGHT':
                 this._showDomToast(`Purchased ${data.name || 'item'}! Coins: ${data.coins}c`, '#b8860b');
@@ -402,6 +377,12 @@ export default class NetworkClient {
             case 'PLAYER_LEFT':
                 this.scene.events.emit('player-left', data);
                 break;
+            case 'PLAYER_PET':
+                this.scene.events.emit('player-pet', data);
+                break;
+            case 'PLAYER_PET_CARE':
+                this.scene.events.emit('player-pet-care', data);
+                break;
             default:
                 this.scene.events.emit('packet-' + op, data);
                 break;
@@ -417,7 +398,6 @@ export default class NetworkClient {
         this.inventory = data.inventory || [];
         this.equipped = data.equipped || {};
         this.canRename = data.canRename || false;
-        this.role = data.role || 'player';
         this.party = data.party || null;
         this.dailyBonus = data.dailyBonus || 0;
 
@@ -441,6 +421,8 @@ export default class NetworkClient {
 
         this.scene.events.emit('player-data', data);
         this.scene.events.emit('net-connected', { playerId: this.playerId });
+        // carrega estado social apos autenticacao
+        this.getSocial();
     }
 
     // Toast DOM simples — visível mesmo sem wardrobe/HUD abertos
